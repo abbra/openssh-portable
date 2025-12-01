@@ -81,6 +81,7 @@ typedef struct {
 	struct ssh_gssapi_mech_struct *mech;
 	ssh_gssapi_ccache store;
 	char **indicators; /* auth indicators */
+	int allow_self; /* allow protocol transition */
 } ssh_gssapi_client;
 
 typedef struct ssh_gssapi_mech_struct {

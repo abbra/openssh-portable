@@ -140,6 +140,7 @@ initialize_server_options(ServerOptions *options)
 	options->gss_deleg_creds = -1;
 	options->gss_strict_acceptor = -1;
 	options->gss_indicators = NULL;
+	options->gss_allow_self = -1;
 	options->password_authentication = -1;
 	options->kbd_interactive_authentication = -1;
 	options->permit_empty_passwd = -1;
@@ -570,7 +571,7 @@ typedef enum {
 	sPerSourcePenalties, sPerSourcePenaltyExemptList,
 	sClientAliveInterval, sClientAliveCountMax, sAuthorizedKeysFile,
 	sGssAuthentication, sGssCleanupCreds, sGssDelegateCreds, sGssStrictAcceptor,
-	sGssIndicators,
+	sGssIndicators, sGssAllowSelf,
 	sAcceptEnv, sSetEnv, sPermitTunnel,
 	sMatch, sPermitOpen, sPermitListen, sForceCommand, sChrootDirectory,
 	sUsePrivilegeSeparation, sAllowAgentForwarding,
@@ -659,12 +660,14 @@ static struct {
 	{ "gssapidelegatecredentials", sGssDelegateCreds, SSHCFG_GLOBAL },
 	{ "gssapistrictacceptorcheck", sGssStrictAcceptor, SSHCFG_GLOBAL },
 	{ "gssapiindicators", sGssIndicators, SSHCFG_ALL },
+	{ "gssapiallowself", sGssAllowSelf, SSHCFG_ALL },
 #else
 	{ "gssapiauthentication", sUnsupported, SSHCFG_ALL },
 	{ "gssapicleanupcredentials", sUnsupported, SSHCFG_GLOBAL },
 	{ "gssapidelegatecredentials", sUnsupported, SSHCFG_GLOBAL },
 	{ "gssapistrictacceptorcheck", sUnsupported, SSHCFG_GLOBAL },
 	{ "gssapiindicators", sUnsupported, SSHCFG_ALL },
+	{ "gssapiallowself", sUnsupported, SSHCFG_ALL },
 #endif
 	{ "passwordauthentication", sPasswordAuthentication, SSHCFG_ALL },
 	{ "kbdinteractiveauthentication", sKbdInteractiveAuthentication, SSHCFG_ALL },
@@ -1678,6 +1681,10 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		if (options->gss_indicators == NULL)
 			options->gss_indicators = xstrdup(arg);
 		break;
+
+	case sGssAllowSelf:
+		intptr = &options->gss_allow_self;
+		goto parse_flag;
 
 	case sPasswordAuthentication:
 		intptr = &options->password_authentication;

@@ -154,6 +154,7 @@ typedef struct {
 	int     gss_cleanup_creds;	/* If true, destroy cred cache on logout */
 	int     gss_deleg_creds;	/* If true, accept delegated GSS credentials */
 	int     gss_strict_acceptor;	/* If true, restrict the GSSAPI acceptor name */
+	int     gss_allow_self; /* Allow to do protocol transition (S4U2Self) */
 	int     password_authentication;	/* If true, permit password
 						 * authentication. */
 	int     kbd_interactive_authentication;	/* If true, permit */

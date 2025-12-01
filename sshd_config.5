@@ -810,6 +810,22 @@ FIDO2-based pre-authentication in FreeIPA, using FIDO2 USB and NFC tokens
 The default
 .Dq none
 is to not use GSSAPI authentication indicators for access decisions.
+.It Cm GSSAPIAllowSelf
+If set to
+.Cm yes ,
+after a successful authentication using any other authentication method, SSH
+server will do a protocol transition (S4U2Self) by requesting a Kerberos
+service ticket to itself on behalf of the user principal. The option is no-op
+in case delegated GSSAPI credentials are already available. The requested
+service ticket to the Kerberos service principal would be stored in the default
+credentials cache.
+.Pp
+The service ticket obtained through the protocol transition can be used by any
+other application which has access to the Kerberos service principal
+(host/machine.fqdn@REALM) credentials on the same host.
+.Pp
+The default is
+.Cm no .
 .It Cm HostbasedAcceptedAlgorithms
 Specifies the signature algorithms that will be accepted for hostbased
 authentication as a list of comma-separated patterns.
