@@ -3300,6 +3300,8 @@ if test "x$openssl" = "xyes" ; then
 
 	# Check for various EVP support in OpenSSL
 	AC_CHECK_FUNCS([EVP_sha256 EVP_sha384 EVP_sha512 EVP_chacha20])
+	AC_CHECK_FUNCS([EVP_default_properties_is_fips_enabled])
+	AC_CHECK_HEADER([openssl/fips.h])
 
 	# Check complete ECC support in OpenSSL
 	AC_MSG_CHECKING([whether OpenSSL has NID_X9_62_prime256v1])
@@ -5108,6 +5110,13 @@ AC_ARG_WITH([kerberos5],
 #endif
 #ifdef HAVE_GSSAPI_KRB5_H
 # include <gssapi/gssapi_krb5.h>
+#endif
+		]])
+		AC_CHECK_DECLS([GSS_KRB5_NT_X509_CERT], [], [], [[
+#ifdef HAVE_GSSAPI_KRB5_H
+# include <gssapi/gssapi_krb5.h>
+#elif defined(HAVE_GSSAPI_GSSAPI_KRB5_H)
+# include <gssapi_krb5.h>
 #endif
 		]])
 		saved_LIBS="$LIBS"

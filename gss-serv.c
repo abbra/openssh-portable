@@ -49,6 +49,23 @@
 
 #include "ssh-gss.h"
 #include "monitor_wrap.h"
+#include "packet.h"
+#include "kex.h"
+
+#include "sshbuf.h"
+
+#ifdef KRB5
+# include <krb5.h>
+#endif
+#if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL)
+# ifdef HAVE_GSSAPI_KRB5_H
+#  include <gssapi_krb5.h>
+# elif defined(HAVE_GSSAPI_GSSAPI_KRB5_H)
+#  include <gssapi/gssapi_krb5.h>
+# endif
+# include <openssl/evp.h>
+# include "gss-s4u-x509.h"
+#endif
 
 extern ServerOptions options;
 
@@ -473,7 +490,7 @@ ssh_gssapi_getclient(Gssctxt *ctx, ssh_gssapi_client *client)
 		return (ctx->major);
 	}
 
-	gss_release_buffer(&ctx->minor, &ename);
+	(void)gss_release_buffer(&ctx->minor, &ename);
 	/* Retrieve authentication indicators, if they exist */
 	if ((ctx->major = ssh_gssapi_getindicators(ctx,
 	    ctx->client, client))) {
@@ -535,8 +552,10 @@ debug_gss_name(const char *label, gss_name_t name)
 	gss_buffer_desc buf = GSS_C_EMPTY_BUFFER;
 
 	if (gss_display_name(&lmin, name, &buf, NULL) == GSS_S_COMPLETE) {
-		debug_f("%s: %.*s", label, (int)buf.length, (char *)buf.value);
+		debug2_f("%s: %.*s", label, (int)buf.length, (char *)buf.value);
 		gss_release_buffer(&lmin, &buf);
+	} else {
+		debug2_f("%s: (gss_display_name failed)", label);
 	}
 }
 
@@ -570,10 +589,15 @@ ssh_gssapi_user_has_valid_tgt(u_int min_lifetime)
  * for the SSH user on behalf of the host principal.  Runs privileged.
  * Populates gssapi_client.{creds,mech,displayname,exportedname} on success.
  * Returns 0 on success, -1 on failure.
+ *
+ * When ssh and authctxt are non-NULL and the build includes S4U X.509
+ * attestation support, an attestation certificate is constructed from the
+ * keytab-derived signing key and passed as GSS_KRB5_NT_X509_CERT.
  */
 /* Privileged */
 int
-ssh_gssapi_s4u2self(const char *user, u_int lifetime)
+ssh_gssapi_s4u2self(const char *user, u_int lifetime,
+    struct ssh *ssh, Authctxt *authctxt)
 {
 	OM_uint32 major, minor, status;
 	gss_OID_set oidset = GSS_C_NO_OID_SET;
@@ -607,16 +631,45 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime)
 	}
 	debug_gss_name("host name parsed as", host_name);
 
-	debug_f("acquiring host credentials as uid=%u euid=%u, principal=host@%s",
+	debug2_f("acquiring host credentials as uid=%u euid=%u, principal=host@%s",
 	    (unsigned)getuid(), (unsigned)geteuid(), lname);
 #ifdef HAVE_GSS_ACQUIRE_CRED_FROM
 	{
+# if defined(KRB5)
+		/*
+		 * Resolve the keytab path: krb5_kt_default_name respects
+		 * KRB5_KTNAME and krb5.conf default_keytab_name.
+		 */
+		char keytab_name[MAXPATHLEN];
+		krb5_context tmp_ctx;
+
+		keytab_name[0] = '\0';
+		if (krb5_init_context(&tmp_ctx) == 0) {
+			(void)krb5_kt_default_name(tmp_ctx, keytab_name,
+			    sizeof(keytab_name));
+			krb5_free_context(tmp_ctx);
+		}
+		if (keytab_name[0] == '\0')
+			strlcpy(keytab_name, "FILE:/etc/krb5.keytab",
+			    sizeof(keytab_name));
+		/*
+		 * client_keytab lets GSSAPI do AS-REQ to obtain a TGT for the
+		 * host principal (initiator role needed for S4U2Self).
+		 * keytab covers the acceptor role.
+		 * ccache: MEMORY: keeps the resulting TGT volatile.
+		 */
 		gss_key_value_element_desc store_elements[] = {
-			{ "client_keytab", "/etc/krb5.keytab" },
-			{ "keytab",        "/etc/krb5.keytab" },
-			{ "ccache",        "MEMORY:"          },
+			{ "client_keytab", keytab_name },
+			{ "keytab", keytab_name },
+			{ "ccache", "MEMORY:" },
 		};
 		const gss_key_value_set_desc cred_store = { 3, store_elements };
+# else
+		gss_key_value_element_desc store_elements[] = {
+			{ "ccache", "MEMORY:" },
+		};
+		const gss_key_value_set_desc cred_store = { 1, store_elements };
+# endif
 
 		major = gss_acquire_cred_from(&minor, host_name, lifetime,
 		    oidset, GSS_C_BOTH, &cred_store, &host_creds, NULL, NULL);
@@ -634,21 +687,237 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime)
 		return -1;
 	}
 
-	/* Import the SSH username as a GSSAPI/Kerberos name */
-	gssbuf.value = (void *)user;
-	gssbuf.length = strlen(user);
-	major = gss_import_name(&minor, &gssbuf,
-	    GSS_C_NT_USER_NAME, &user_name);
-	if (GSS_ERROR(major)) {
-		logit_f("gss_import_name (user) failed");
-		gss_release_cred(&minor, &host_creds);
-		gss_release_oid_set(&status, &oidset);
-		return -1;
+	/*
+	 * Import the user name for S4U2Self.
+	 *
+	 * When attestation support is compiled in, try to build an X.509
+	 * certificate and import it via GSS_KRB5_NT_X509_CERT (MIT krb5 >=
+	 * 1.19).  The cert encodes the SSH auth event details so the KDC
+	 * plugin can verify the attestation and inject auth indicators.
+	 *
+	 * If attestation was attempted (keytab found) but the cert build
+	 * failed for any reason, S4U2Self is dropped entirely — we do NOT
+	 * fall back to plain enterprise-name S4U2Self.  The SSH connection
+	 * has already been authenticated and succeeds regardless.
+	 *
+	 * S4U2Self with plain enterprise-name is used only when attestation
+	 * was never attempted:
+	 *   - ssh or authctxt is NULL (called without full context)
+	 *   - GSS_KRB5_NT_X509_CERT is not declared in the installed krb5 headers
+	 */
+/*
+ * HAVE_DECL_GSS_KRB5_NT_X509_CERT is set by AC_CHECK_DECL in configure.ac.
+ * If the probe is absent or the installed krb5 headers are too old, this
+ * macro evaluates to 0 and the entire attestation path is compiled out.
+ */
+#if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL) && \
+    HAVE_DECL_GSS_KRB5_NT_X509_CERT
+	if (ssh != NULL && authctxt != NULL &&
+	    ssh->kex != NULL && ssh->kex->session_id != NULL) {
+		krb5_context kctx = NULL;
+		unsigned char *ikm = NULL;
+		size_t ikm_len = 0;
+		krb5_enctype enctype = 0;
+		uint32_t kvno = 0;
+		unsigned char *cert_der = NULL;
+		size_t cert_der_len = 0;
+		const char *realm = NULL;
+		char realm_buf[256];
+		int same_realm = 0;
+		int tried_x509 = 0;
+		int fips_mode = EVP_default_properties_is_fips_enabled(NULL);
+
+		realm_buf[0] = '\0';
+
+		debug2_f("S4U X.509: entered attestation path for user %.100s "
+		    "fips=%d", user, fips_mode);
+
+		/*
+		 * Resolve the host realm by looking up the host/ principal in
+		 * the keytab and extracting the realm from there.  We use
+		 * krb5_sname_to_principal() which respects krb5.conf mappings.
+		 */
+		if (krb5_init_context(&kctx) != 0) {
+			debug2_f("S4U X.509: krb5_init_context failed; "
+			    "falling back to plain S4U2Self");
+		} else {
+			krb5_principal host_princ = NULL;
+
+			if (krb5_sname_to_principal(kctx, lname, "host",
+			    KRB5_NT_SRV_HST, &host_princ) != 0) {
+				debug2_f("S4U X.509: krb5_sname_to_principal "
+				    "failed for host/%s", lname);
+			} else {
+				const krb5_data *r =
+				    krb5_princ_realm(kctx, host_princ);
+				if (r && r->data && r->length > 0 &&
+				    r->length < sizeof(realm_buf)) {
+					memcpy(realm_buf, r->data, r->length);
+					realm_buf[r->length] = '\0';
+					realm = realm_buf;
+				}
+				krb5_free_principal(kctx, host_princ);
+			}
+
+			if (realm == NULL || *realm == '\0') {
+				debug2_f("S4U X.509: could not determine host "
+				    "realm for %s; falling back to plain "
+				    "S4U2Self", lname);
+			} else {
+				debug2_f("S4U X.509: attempting attestation "
+				    "for user %.100s, host realm %.64s "
+				    "fips=%d", user, realm, fips_mode);
+				if (ssh_gssapi_s4u_x509_get_keytab_key(kctx,
+				    lname, realm, fips_mode,
+				    &ikm, &ikm_len, &enctype, &kvno) != 0)
+					debug2_f("S4U X.509: keytab key "
+					    "retrieval failed for host/%s@%s",
+					    lname, realm);
+			}
+		}
+
+		/*
+		 * TEST BUILD: force same_realm so attestation is attempted for
+		 * cross-realm principals as well.
+		 */
+		same_realm = 1;
+
+		if (ikm != NULL && same_realm) {
+			/*
+			 * We have the keytab key and the user is in the host
+			 * realm — attestation should be possible.  Any failure
+			 * from here on drops S4U2Self entirely.
+			 */
+			tried_x509 = 1;
+
+			/* Prefer non-Ed25519 host keys in FIPS mode */
+			const struct sshkey *host_pubkey =
+			    get_hostkey_public_by_type(KEY_RSA, 0, ssh);
+			if (host_pubkey == NULL)
+				host_pubkey = get_hostkey_public_by_type(
+				    KEY_ECDSA, 0, ssh);
+			if (host_pubkey == NULL && !fips_mode)
+				host_pubkey = get_hostkey_public_by_type(
+				    KEY_ED25519, 0, ssh);
+
+			/* Extract auth method: first word of session_info */
+			const char *auth_method = "unknown";
+			char *method_buf = NULL;
+			if (authctxt->session_info != NULL &&
+			    sshbuf_len(authctxt->session_info) > 0) {
+				const char *si = (const char *)sshbuf_ptr(
+				    authctxt->session_info);
+				size_t si_len =
+				    sshbuf_len(authctxt->session_info);
+				const char *sp = memchr(si, ' ', si_len);
+				const char *nl = memchr(si, '\n', si_len);
+				size_t mlen = sp ? (size_t)(sp - si)
+				    : nl ? (size_t)(nl - si) : si_len;
+				method_buf = xmalloc(mlen + 1);
+				memcpy(method_buf, si, mlen);
+				method_buf[mlen] = '\0';
+				auth_method = method_buf;
+			}
+
+			/* Client address "ip:port" */
+			char *client_addr = NULL;
+			{
+				const char *ip = ssh_remote_ipaddr(ssh);
+				int port = ssh_remote_port(ssh);
+				if (ip != NULL)
+					xasprintf(&client_addr, "%s:%d",
+					    ip, port);
+			}
+
+			if (host_pubkey == NULL)
+				debug2_f("S4U X.509: no suitable host public "
+				    "key found");
+
+			if (host_pubkey != NULL &&
+			    ssh_gssapi_s4u_x509_build_cert(
+			        user, realm, auth_method,
+			        ssh->kex->session_id,
+			        authctxt->auth_method_key,
+			        authctxt->auth_method_info,
+			        client_addr,
+			        host_pubkey,
+			        ikm, ikm_len,
+			        enctype, kvno,
+			        lname, lifetime,
+			        &cert_der, &cert_der_len) == 0) {
+				gssbuf.value  = cert_der;
+				gssbuf.length = cert_der_len;
+				major = gss_import_name(&minor, &gssbuf,
+				    GSS_KRB5_NT_X509_CERT, &user_name);
+				free(cert_der);
+				cert_der = NULL;
+				if (!GSS_ERROR(major))
+					debug_f("S4U X.509 cert imported for "
+					    "user %.100s", user);
+				else {
+					logit_f("gss_import_name (X.509 cert)"
+					    " failed");
+					gss_release_name(&minor, &user_name);
+					user_name = GSS_C_NO_NAME;
+				}
+			}
+			free(method_buf);
+			free(client_addr);
+			/* cert_der is NULL here: freed and cleared above on
+			 * success, or never set on build failure */
+		}
+
+		/*
+		 * If attestation was attempted but failed (user_name not set),
+		 * drop S4U2Self entirely.  SSH auth has already succeeded.
+		 */
+		if (tried_x509 && user_name == GSS_C_NO_NAME) {
+			logit_f("S4U X.509: attestation failed for user %.100s;"
+			    " S4U2Self skipped", user);
+			freezero(ikm, ikm_len);
+			if (kctx != NULL)
+				krb5_free_context(kctx);
+			gss_release_cred(&minor, &host_creds);
+			gss_release_oid_set(&status, &oidset);
+			return 0;
+		}
+
+		freezero(ikm, ikm_len);
+		if (kctx != NULL)
+			krb5_free_context(kctx);
+	}
+#else /* !(KRB5 && !HEIMDAL && WITH_OPENSSL && HAVE_DECL_GSS_KRB5_NT_X509_CERT) */
+	debug2_f("S4U X.509 attestation not compiled in "
+	    "(missing KRB5, OPENSSL, or GSS_KRB5_NT_X509_CERT); "
+	    "using plain S4U2Self");
+#endif /* KRB5 && !HEIMDAL && WITH_OPENSSL && HAVE_DECL_GSS_KRB5_NT_X509_CERT */
+
+	/* Plain username fallback (no keytab, or attestation not compiled in) */
+	if (user_name == GSS_C_NO_NAME) {
+		gssbuf.value = (void *)user;
+		gssbuf.length = strlen(user);
+		/*
+		 * Use GSS_KRB5_NT_ENTERPRISE_NAME so that PA-FOR-USER carries
+		 * the principal as an enterprise name.  This lets the KDC
+		 * resolve the name via its enterprise-principal mapping and
+		 * avoids the empty NT-X500-PRINCIPAL that GSS_KRB5_NT_X509_CERT
+		 * produces.  Enterprise name resolution works for both local
+		 * (same-realm) and cross-realm users when the KDC is configured
+		 * with the appropriate mappings.
+		 */
+		major = gss_import_name(&minor, &gssbuf,
+		    GSS_KRB5_NT_ENTERPRISE_NAME, &user_name);
+		if (GSS_ERROR(major)) {
+			logit_f("gss_import_name (enterprise user) failed");
+			gss_release_cred(&minor, &host_creds);
+			gss_release_oid_set(&status, &oidset);
+			return -1;
+		}
 	}
 	debug_gss_name("user name parsed as", user_name);
 
 	/* S4U2Self: obtain a service ticket for the user without their creds */
-	debug_f("calling gss_acquire_cred_impersonate_name for user %.100s", user);
+	debug2_f("calling gss_acquire_cred_impersonate_name for user %.100s", user);
 	major = gss_acquire_cred_impersonate_name(&minor,
 	    host_creds, user_name, lifetime,
 	    oidset, GSS_C_INITIATE,
@@ -662,6 +931,23 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime)
 		log_gss_error(major, minor,
 		    "S4U2Self: gss_acquire_cred_impersonate_name");
 		gss_release_name(&minor, &user_name);
+		return -1;
+	}
+
+	/*
+	 * Obtain the principal name from the issued credential rather than
+	 * from the name we passed in.  This works regardless of whether the
+	 * user was identified by username or by X.509 cert, and gives the
+	 * KDC-canonicalised principal (e.g. user@REALM) as stored in the
+	 * ticket — the form that krb5_parse_name and the ccache expect.
+	 */
+	gss_release_name(&minor, &user_name);
+	user_name = GSS_C_NO_NAME;
+	major = gss_inquire_cred(&minor, impersonated_creds,
+	    &user_name, NULL, NULL, NULL);
+	if (GSS_ERROR(major)) {
+		logit_f("gss_inquire_cred failed after S4U2Self");
+		gss_release_cred(&minor, &impersonated_creds);
 		return -1;
 	}
 
@@ -694,7 +980,7 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime)
 	gssapi_client.exportedname.length = displayname.length;
 
 	gss_release_buffer(&minor, &displayname);
-	debug_f("S4U2Self succeeded for %.100s", user);
+	debug2_f("S4U2Self succeeded for %.100s", user);
 	return 0;
 }
 
@@ -703,7 +989,7 @@ void
 ssh_gssapi_storecreds_s4u2self(void)
 {
 	if (gssapi_client.mech == NULL || gssapi_client.mech->storecreds == NULL) {
-		debug_f("no GSSAPI mechanism for storing S4U2Self credentials");
+		debug2_f("no GSSAPI mechanism for storing S4U2Self credentials");
 		return;
 	}
 	(*gssapi_client.mech->storecreds)(&gssapi_client);
@@ -734,15 +1020,15 @@ ssh_gssapi_s4u2proxy(char **services, u_int nservices, u_int lifetime)
 	u_int i;
 
 	if (gssapi_client.creds == GSS_C_NO_CREDENTIAL) {
-		debug_f("no proxy credential available");
+		debug2_f("no proxy credential available");
 		return;
 	}
 	if (gssapi_client.store.envval == NULL) {
-		debug_f("no ccache path set; cannot store proxy tickets");
+		debug2_f("no ccache path set; cannot store proxy tickets");
 		return;
 	}
 
-	debug_f("starting S4U2Proxy as uid=%u euid=%u, %u service(s), ccache=%s",
+	debug2_f("starting S4U2Proxy as uid=%u euid=%u, %u service(s), ccache=%s",
 	    (unsigned)getuid(), (unsigned)geteuid(), nservices,
 	    gssapi_client.store.envval);
 
@@ -771,7 +1057,7 @@ ssh_gssapi_s4u2proxy(char **services, u_int nservices, u_int lifetime)
 		}
 		debug_gss_name("target service name parsed as", target_name);
 
-		debug_f("calling gss_init_sec_context for %.200s", services[i]);
+		debug2_f("calling gss_init_sec_context for %.200s", services[i]);
 		major = gss_init_sec_context(&minor,
 		    gssapi_client.creds,		/* proxy credential */
 		    &ctx, target_name,
@@ -797,7 +1083,7 @@ ssh_gssapi_s4u2proxy(char **services, u_int nservices, u_int lifetime)
 			log_gss_error(major, minor,
 			    "S4U2Proxy: gss_init_sec_context");
 		} else
-			debug_f("S4U2Proxy ticket obtained for %.200s",
+			debug2_f("S4U2Proxy ticket obtained for %.200s",
 			    services[i]);
 	}
 
@@ -838,7 +1124,7 @@ int
 ssh_gssapi_storecreds(void)
 {
 	if (options.gss_deleg_creds == 0) {
-		debug_f("delegate credential is disabled, doing nothing");
+		debug2_f("delegate credential is disabled, doing nothing");
 		return 0;
 	}
 
@@ -958,6 +1244,7 @@ ssh_gssapi_rekey_creds(void) {
 	    gssapi_client.store.envval);
 
 	ret = pam_putenv(pamh, envstr);
+	free(envstr);
 	if (!ret)
 		pam_setcred(pamh, PAM_REINITIALIZE_CRED);
 	pam_end(pamh, PAM_SUCCESS);

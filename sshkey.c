@@ -36,7 +36,20 @@
 #include <openssl/evp.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
-#include <openssl/fips.h>
+#ifdef HAVE_OPENSSL_FIPS_H
+# include <openssl/fips.h>
+#else
+/*
+ * openssl/fips.h does not exist on standard OpenSSL 3.x builds.
+ * Map FIPS_mode() to the modern EVP_default_properties_is_fips_enabled()
+ * when available, otherwise treat FIPS as disabled.
+ */
+# ifdef HAVE_EVP_DEFAULT_PROPERTIES_IS_FIPS_ENABLED
+#  define FIPS_mode() EVP_default_properties_is_fips_enabled(NULL)
+# else
+#  define FIPS_mode() 0
+# endif
+#endif
 #endif
 
 #include "crypto_api.h"

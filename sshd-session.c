@@ -1480,7 +1480,8 @@ main(int ac, char **av)
 			debug_f("user %.100s already has valid Kerberos "
 			    "credentials, skipping S4U2Self",
 			    authctxt->user);
-		} else if (ssh_gssapi_s4u2self(authctxt->user, lifetime) == 0) {
+		} else if (ssh_gssapi_s4u2self(authctxt->user, lifetime,
+		    ssh, authctxt) == 0) {
 			u_int filter;
 
 			temporarily_use_uid(authctxt->pw);
