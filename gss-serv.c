@@ -49,6 +49,21 @@
 
 #include "ssh-gss.h"
 #include "monitor_wrap.h"
+#include "packet.h"
+#include "kex.h"
+
+#include "sshbuf.h"
+
+#if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL)
+# ifdef HAVE_GSSAPI_KRB5_H
+#  include <gssapi_krb5.h>
+# elif defined(HAVE_GSSAPI_GSSAPI_KRB5_H)
+#  include <gssapi/gssapi_krb5.h>
+# endif
+# include <krb5.h>
+# include <openssl/evp.h>
+# include "gss-s4u-x509.h"
+#endif
 
 extern ServerOptions options;
 
@@ -570,10 +585,17 @@ ssh_gssapi_user_has_valid_tgt(u_int min_lifetime)
  * for the SSH user on behalf of the host principal.  Runs privileged.
  * Populates gssapi_client.{creds,mech,displayname,exportedname} on success.
  * Returns 0 on success, -1 on failure.
+ *
+ * When ssh and authctxt are non-NULL and the build includes S4U X.509
+ * attestation support, an attestation certificate is constructed from the
+ * keytab-derived signing key and passed as GSS_KRB5_NT_X509_CERT.  For
+ * cross-realm users (user realm != host realm) the plain username path
+ * is used instead, as the KDC would not verify the cert in that case.
  */
 /* Privileged */
 int
-ssh_gssapi_s4u2self(const char *user, u_int lifetime)
+ssh_gssapi_s4u2self(const char *user, u_int lifetime,
+    struct ssh *ssh, Authctxt *authctxt)
 {
 	OM_uint32 major, minor, status;
 	gss_OID_set oidset = GSS_C_NO_OID_SET;
@@ -634,16 +656,171 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime)
 		return -1;
 	}
 
-	/* Import the SSH username as a GSSAPI/Kerberos name */
-	gssbuf.value = (void *)user;
-	gssbuf.length = strlen(user);
-	major = gss_import_name(&minor, &gssbuf,
-	    GSS_C_NT_USER_NAME, &user_name);
-	if (GSS_ERROR(major)) {
-		logit_f("gss_import_name (user) failed");
-		gss_release_cred(&minor, &host_creds);
-		gss_release_oid_set(&status, &oidset);
-		return -1;
+	/*
+	 * Import the user name for S4U2Self.
+	 *
+	 * When attestation support is compiled in, try to build an X.509
+	 * certificate and import it via GSS_KRB5_NT_X509_CERT (MIT krb5 >=
+	 * 1.19).  The cert encodes the SSH auth event details so the KDC
+	 * plugin can verify the attestation and inject auth indicators.
+	 *
+	 * Fall back to plain GSS_C_NT_USER_NAME if:
+	 *   - ssh or authctxt is NULL (called without context)
+	 *   - the cert cannot be built (keytab missing, FIPS constraints, ...)
+	 *   - the user's realm differs from the host realm (cross-realm: the
+	 *     KDC does not call get_s4u_x509_principal for foreign realms)
+	 *   - GSS_KRB5_NT_X509_CERT is not defined in the installed krb5
+	 */
+#if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL) && \
+    defined(GSS_KRB5_NT_X509_CERT)
+	if (ssh != NULL && authctxt != NULL &&
+	    ssh->kex != NULL && ssh->kex->session_id != NULL) {
+		krb5_context kctx = NULL;
+		unsigned char *ikm = NULL;
+		size_t ikm_len = 0;
+		krb5_enctype enctype = 0;
+		uint32_t kvno = 0;
+		unsigned char *cert_der = NULL;
+		size_t cert_der_len = 0;
+		const char *realm = NULL;
+		int same_realm = 0;
+		int fips_mode = EVP_default_properties_is_fips_enabled(NULL);
+
+		/*
+		 * Resolve the host realm by looking up the host/ principal in
+		 * the keytab and extracting the realm from there.  We use
+		 * krb5_sname_to_principal() which respects krb5.conf mappings.
+		 */
+		if (krb5_init_context(&kctx) == 0) {
+			krb5_principal host_princ = NULL;
+			static char realm_buf[256];
+			realm_buf[0] = '\0';
+
+			if (krb5_sname_to_principal(kctx, lname, "host",
+			    KRB5_NT_SRV_HST, &host_princ) == 0) {
+				const krb5_data *r =
+				    krb5_princ_realm(kctx, host_princ);
+				if (r && r->data && r->length > 0 &&
+				    r->length < sizeof(realm_buf)) {
+					memcpy(realm_buf, r->data, r->length);
+					realm_buf[r->length] = '\0';
+					realm = realm_buf;
+				}
+				krb5_free_principal(kctx, host_princ);
+			}
+
+			if (realm != NULL && *realm != '\0') {
+				ssh_gssapi_s4u_x509_get_keytab_key(kctx,
+				    lname, realm, fips_mode,
+				    &ikm, &ikm_len, &enctype, &kvno);
+			}
+		}
+
+		/*
+		 * Determine whether the user's realm matches the host realm.
+		 * If the username has no '@', assume it is a local name in the
+		 * same realm.  Compare case-insensitively per Kerberos norms.
+		 */
+		{
+			const char *at = strrchr(user, '@');
+			if (at == NULL || realm == NULL || *realm == '\0') {
+				same_realm = 1;
+			} else {
+				same_realm =
+				    (strcasecmp(at + 1, realm) == 0);
+			}
+		}
+
+		if (ikm != NULL && same_realm) {
+			/* Prefer non-Ed25519 host keys in FIPS mode */
+			const struct sshkey *host_pubkey =
+			    get_hostkey_public_by_type(KEY_RSA, 0, ssh);
+			if (host_pubkey == NULL)
+				host_pubkey = get_hostkey_public_by_type(
+				    KEY_ECDSA, 0, ssh);
+			if (host_pubkey == NULL && !fips_mode)
+				host_pubkey = get_hostkey_public_by_type(
+				    KEY_ED25519, 0, ssh);
+
+			/* Extract auth method: first word of session_info */
+			const char *auth_method = "unknown";
+			char *method_buf = NULL;
+			if (authctxt->session_info != NULL &&
+			    sshbuf_len(authctxt->session_info) > 0) {
+				const char *si = (const char *)sshbuf_ptr(
+				    authctxt->session_info);
+				size_t si_len =
+				    sshbuf_len(authctxt->session_info);
+				const char *sp = memchr(si, ' ', si_len);
+				const char *nl = memchr(si, '\n', si_len);
+				size_t mlen = sp ? (size_t)(sp - si)
+				    : nl ? (size_t)(nl - si) : si_len;
+				method_buf = xmalloc(mlen + 1);
+				memcpy(method_buf, si, mlen);
+				method_buf[mlen] = '\0';
+				auth_method = method_buf;
+			}
+
+			/* Client address "ip:port" */
+			char *client_addr = NULL;
+			{
+				const char *ip = ssh_remote_ipaddr(ssh);
+				int port = ssh_remote_port(ssh);
+				if (ip != NULL)
+					xasprintf(&client_addr, "%s:%d",
+					    ip, port);
+			}
+
+			if (host_pubkey != NULL &&
+			    ssh_gssapi_s4u_x509_build_cert(
+			        user, realm, auth_method,
+			        ssh->kex->session_id,
+			        authctxt->auth_method_key,
+			        authctxt->auth_method_info,
+			        client_addr,
+			        host_pubkey,
+			        ikm, ikm_len,
+			        enctype, kvno,
+			        lname, lifetime,
+			        &cert_der, &cert_der_len) == 0) {
+				gssbuf.value  = cert_der;
+				gssbuf.length = cert_der_len;
+				major = gss_import_name(&minor, &gssbuf,
+				    GSS_KRB5_NT_X509_CERT, &user_name);
+				free(cert_der);
+				cert_der = NULL;
+				if (!GSS_ERROR(major))
+					debug_f("S4U X.509 cert imported for "
+					    "user %.100s", user);
+				else {
+					logit_f("gss_import_name (X.509 cert)"
+					    " failed; falling back to username");
+					gss_release_name(&minor, &user_name);
+					user_name = GSS_C_NO_NAME;
+				}
+			}
+			free(method_buf);
+			free(client_addr);
+			free(cert_der);
+		}
+		free(ikm);
+		if (kctx != NULL)
+			krb5_free_context(kctx);
+	}
+#endif /* KRB5 && !HEIMDAL && WITH_OPENSSL && GSS_KRB5_NT_X509_CERT */
+
+	/* Plain username fallback (cross-realm, no keytab, or cert failed) */
+	if (user_name == GSS_C_NO_NAME) {
+		gssbuf.value = (void *)user;
+		gssbuf.length = strlen(user);
+		major = gss_import_name(&minor, &gssbuf,
+		    GSS_C_NT_USER_NAME, &user_name);
+		if (GSS_ERROR(major)) {
+			logit_f("gss_import_name (user) failed");
+			gss_release_cred(&minor, &host_creds);
+			gss_release_oid_set(&status, &oidset);
+			return -1;
+		}
 	}
 	debug_gss_name("user name parsed as", user_name);
 

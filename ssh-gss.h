@@ -164,7 +164,9 @@ void ssh_gssapi_supported_oids(gss_OID_set *);
 void ssh_gssapi_prepare_supported_oids(void);
 OM_uint32 ssh_gssapi_test_oid_supported(OM_uint32 *, gss_OID, int *);
 
+struct ssh;
 struct sshbuf;
+struct Authctxt;
 int ssh_gssapi_get_buffer_desc(struct sshbuf *, gss_buffer_desc *);
 int ssh_gssapi_sshpkt_get_buffer_desc(struct ssh *, gss_buffer_desc *);
 
@@ -204,7 +206,7 @@ int  ssh_gssapi_credentials_stored(void);
 ssh_gssapi_ccache *ssh_gssapi_get_ccache(void);
 int  ssh_gssapi_user_has_valid_tgt(u_int);
 int  ssh_gssapi_user_has_valid_proxy_tickets(char **, u_int, u_int);
-int  ssh_gssapi_s4u2self(const char *, u_int);
+int  ssh_gssapi_s4u2self(const char *, u_int, struct ssh *, struct Authctxt *);
 void ssh_gssapi_storecreds_s4u2self(void);
 void ssh_gssapi_s4u2proxy(char **, u_int, u_int);
 /* Flags for ssh_gssapi_krb5_filter_ccache(): which ticket classes to remove */
