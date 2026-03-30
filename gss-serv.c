@@ -686,18 +686,27 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 		int same_realm = 0;
 		int fips_mode = EVP_default_properties_is_fips_enabled(NULL);
 
+		debug_f("S4U X.509: entered attestation path for user %.100s "
+		    "fips=%d", user, fips_mode);
+
 		/*
 		 * Resolve the host realm by looking up the host/ principal in
 		 * the keytab and extracting the realm from there.  We use
 		 * krb5_sname_to_principal() which respects krb5.conf mappings.
 		 */
-		if (krb5_init_context(&kctx) == 0) {
+		if (krb5_init_context(&kctx) != 0) {
+			debug_f("S4U X.509: krb5_init_context failed; "
+			    "falling back to plain S4U2Self");
+		} else {
 			krb5_principal host_princ = NULL;
 			static char realm_buf[256];
 			realm_buf[0] = '\0';
 
 			if (krb5_sname_to_principal(kctx, lname, "host",
-			    KRB5_NT_SRV_HST, &host_princ) == 0) {
+			    KRB5_NT_SRV_HST, &host_princ) != 0) {
+				debug_f("S4U X.509: krb5_sname_to_principal "
+				    "failed for host/%s", lname);
+			} else {
 				const krb5_data *r =
 				    krb5_princ_realm(kctx, host_princ);
 				if (r && r->data && r->length > 0 &&
@@ -709,7 +718,11 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 				krb5_free_principal(kctx, host_princ);
 			}
 
-			if (realm != NULL && *realm != '\0') {
+			if (realm == NULL || *realm == '\0') {
+				debug_f("S4U X.509: could not determine host "
+				    "realm for %s; falling back to plain "
+				    "S4U2Self", lname);
+			} else {
 				debug_f("S4U X.509: attempting attestation "
 				    "for user %.100s, host realm %.64s "
 				    "fips=%d", user, realm, fips_mode);
@@ -779,6 +792,10 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 					    ip, port);
 			}
 
+			if (host_pubkey == NULL)
+				debug_f("S4U X.509: no suitable host public "
+				    "key found; skipping cert build");
+
 			if (host_pubkey != NULL &&
 			    ssh_gssapi_s4u_x509_build_cert(
 			        user, realm, auth_method,
@@ -815,6 +832,10 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 		if (kctx != NULL)
 			krb5_free_context(kctx);
 	}
+#else /* !(KRB5 && !HEIMDAL && WITH_OPENSSL && GSS_KRB5_NT_X509_CERT) */
+	debug_f("S4U X.509 attestation not compiled in "
+	    "(missing KRB5, OPENSSL, or GSS_KRB5_NT_X509_CERT); "
+	    "using plain S4U2Self");
 #endif /* KRB5 && !HEIMDAL && WITH_OPENSSL && GSS_KRB5_NT_X509_CERT */
 
 	/* Plain username fallback (cross-realm, no keytab, or cert failed) */
