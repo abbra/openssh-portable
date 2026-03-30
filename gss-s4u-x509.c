@@ -49,13 +49,10 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/evp.h>
-#include <openssl/ec.h>
 #include <openssl/bn.h>
 #include <openssl/kdf.h>
 #include <openssl/core_names.h>
 #include <openssl/params.h>
-#include <openssl/param_build.h>
-#include <openssl/obj_mac.h>
 #include <openssl/sha.h>
 #include <openssl/asn1.h>
 #include <openssl/asn1t.h>
@@ -143,28 +140,69 @@ done:
 	return ret;
 }
 
-/* Build HKDF info: hostname || '\0' || realm || '\0' || kvno_be32 */
-static unsigned char *
-build_hkdf_info(const char *hostname, const char *realm, uint32_t kvno,
-    size_t *info_len_out)
+
+/*
+ * NIST P-256 group order n (FIPS 186-4 §D.1.2.3 / SEC2 §2.4.2).
+ * Hard-coded to avoid EC_GROUP_* which is deprecated in OpenSSL 3.x.
+ * This constant is defined by the curve spec and will never change.
+ */
+static const unsigned char P256_ORDER[32] = {
+	0xFF,0xFF,0xFF,0xFF, 0x00,0x00,0x00,0x00,
+	0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
+	0xBC,0xE6,0xFA,0xAD, 0xA7,0x17,0x9E,0x84,
+	0xF3,0xB9,0xCA,0xC2, 0xFC,0x63,0x25,0x51
+};
+
+/*
+ * Derive a P-256 private key from 48 bytes of HKDF output.
+ * NIST SP 800-56A Rev 3 §5.6.1.2.2 "extra bits" method:
+ *   k = (seed mod (n−1)) + 1,  ensuring 1 ≤ k < n.
+ */
+static EVP_PKEY *
+derive_p256_key(const unsigned char *seed48)
 {
-	size_t hlen  = strlen(hostname);
-	size_t rlen  = strlen(realm);
-	size_t total = hlen + 1 + rlen + 1 + 4;
-	unsigned char *buf = malloc(total);
-	if (!buf)
-		return NULL;
+	BN_CTX		*ctx   = NULL;
+	BIGNUM		*raw   = NULL;
+	BIGNUM		*n     = NULL;
+	BIGNUM		*nm1   = NULL;
+	BIGNUM		*k     = NULL;
+	EVP_PKEY_CTX	*pctx  = NULL;
+	EVP_PKEY	*pkey  = NULL;
+	unsigned char	 kbytes[32] = {0};
 
-	unsigned char *p = buf;
-	memcpy(p, hostname, hlen); p += hlen;
-	*p++ = '\0';
-	memcpy(p, realm, rlen);    p += rlen;
-	*p++ = '\0';
-	uint32_t kvno_be = htonl(kvno);
-	memcpy(p, &kvno_be, 4);
+	ctx = BN_CTX_new();
+	raw = BN_bin2bn(seed48, 48, NULL);
+	n   = BN_bin2bn(P256_ORDER, sizeof(P256_ORDER), NULL);
+	nm1 = BN_new();
+	k   = BN_new();
 
-	*info_len_out = total;
-	return buf;
+	if (!ctx || !raw || !n || !nm1 || !k)
+		goto out;
+	if (!BN_copy(nm1, n) || !BN_sub_word(nm1, 1) ||
+	    !BN_mod(k, raw, nm1, ctx) || !BN_add_word(k, 1) ||
+	    BN_bn2binpad(k, kbytes, 32) != 32)
+		goto out;
+
+	pctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+	if (pctx && EVP_PKEY_fromdata_init(pctx) > 0) {
+		OSSL_PARAM params[] = {
+			OSSL_PARAM_construct_utf8_string(
+			    OSSL_PKEY_PARAM_GROUP_NAME, "P-256", 0),
+			OSSL_PARAM_construct_BN(
+			    OSSL_PKEY_PARAM_PRIV_KEY, kbytes, 32),
+			OSSL_PARAM_construct_end()
+		};
+		EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEYPAIR, params);
+	}
+out:
+	OPENSSL_cleanse(kbytes, sizeof(kbytes));
+	EVP_PKEY_CTX_free(pctx);
+	BN_CTX_free(ctx);
+	BN_free(raw);
+	BN_free(n);
+	BN_free(nm1);
+	BN_free(k);
+	return pkey;
 }
 
 /* ------------------------------------------------------------------ *
@@ -180,69 +218,26 @@ derive_attestation_key(const unsigned char *ikm, size_t ikm_len,
 {
 	unsigned char	 seed[48];
 	size_t		 seed_len = fips_mode ? 48 : 32;
-	unsigned char	*info = NULL;
-	size_t		 info_len = 0;
-	EVP_PKEY	*pkey = NULL;
+	uint32_t	 kvno_be  = htonl(kvno);
+	struct sshbuf	*info     = NULL;
+	EVP_PKEY	*pkey     = NULL;
 
-	info = build_hkdf_info(hostname, realm, kvno, &info_len);
-	if (!info)
-		return NULL;
+	/* HKDF info = hostname || NUL || realm || NUL || kvno_be32 */
+	info = sshbuf_new();
+	if (info == NULL ||
+	    sshbuf_put(info, hostname, strlen(hostname) + 1) != 0 ||
+	    sshbuf_put(info, realm,    strlen(realm)    + 1) != 0 ||
+	    sshbuf_put(info, &kvno_be, sizeof(kvno_be))      != 0 ||
+	    hkdf_sha256(ikm, ikm_len, HKDF_SALT, strlen(HKDF_SALT),
+	        sshbuf_ptr(info), sshbuf_len(info), seed, seed_len) != 0)
+		goto done;
 
-	if (hkdf_sha256(ikm, ikm_len, HKDF_SALT, strlen(HKDF_SALT),
-	    info, info_len, seed, seed_len) != 0) {
-		free(info);
-		OPENSSL_cleanse(seed, sizeof(seed));
-		return NULL;
-	}
-	free(info);
+	pkey = fips_mode
+	    ? derive_p256_key(seed)
+	    : EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, seed, 32);
 
-	if (!fips_mode) {
-		pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
-		    seed, 32);
-	} else {
-		BN_CTX		*ctx    = BN_CTX_new();
-		BIGNUM		*raw_bn = BN_bin2bn(seed, 48, NULL);
-		BIGNUM		*order  = BN_new();
-		BIGNUM		*om1    = BN_new();
-		BIGNUM		*scalar = BN_new();
-		EC_GROUP	*group  =
-		    EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
-		unsigned char	 scalar_bytes[32];
-
-		if (!ctx || !raw_bn || !order || !om1 || !scalar || !group)
-			goto p256_cleanup;
-		if (!EC_GROUP_get_order(group, order, ctx) ||
-		    !BN_sub(om1, order, BN_value_one()) ||
-		    !BN_mod(scalar, raw_bn, om1, ctx) ||
-		    !BN_add(scalar, scalar, BN_value_one()) ||
-		    BN_bn2binpad(scalar, scalar_bytes, 32) != 32)
-			goto p256_cleanup;
-		{
-			EVP_PKEY_CTX *pctx =
-			    EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
-			OSSL_PARAM kp[] = {
-				OSSL_PARAM_construct_utf8_string(
-				    OSSL_PKEY_PARAM_GROUP_NAME, "P-256", 0),
-				OSSL_PARAM_construct_BN(
-				    OSSL_PKEY_PARAM_PRIV_KEY,
-				    scalar_bytes, 32),
-				OSSL_PARAM_construct_end()
-			};
-			if (pctx && EVP_PKEY_fromdata_init(pctx) > 0)
-				EVP_PKEY_fromdata(pctx, &pkey,
-				    EVP_PKEY_KEYPAIR, kp);
-			EVP_PKEY_CTX_free(pctx);
-		}
-		OPENSSL_cleanse(scalar_bytes, sizeof(scalar_bytes));
-p256_cleanup:
-		BN_CTX_free(ctx);
-		BN_free(raw_bn);
-		BN_free(order);
-		BN_free(om1);
-		BN_free(scalar);
-		EC_GROUP_free(group);
-	}
-
+done:
+	sshbuf_free(info);
 	OPENSSL_cleanse(seed, sizeof(seed));
 	return pkey;
 }
@@ -276,13 +271,7 @@ sshkey_to_x509_pubkey(const struct sshkey *key)
 	if (!pkey)
 		return NULL;
 
-	unsigned char *der = NULL;
-	int der_len = i2d_PUBKEY(pkey, &der);
-	if (der_len > 0) {
-		const unsigned char *p = der;
-		spki = d2i_X509_PUBKEY(NULL, &p, der_len);
-		OPENSSL_free(der);
-	}
+	X509_PUBKEY_set(&spki, pkey);
 	if (need_free)
 		EVP_PKEY_free(pkey);
 	return spki;
@@ -299,7 +288,7 @@ compute_binding_digest(X509_PUBKEY *spki, const char *principal,
 	unsigned char	*spki_der = NULL;
 	int		 spki_len;
 	uint32_t	 kvno_be  = htonl(kvno);
-	EVP_MD_CTX	*ctx      = NULL;
+	struct sshbuf	*b        = NULL;
 	unsigned int	 dlen     = SHA256_DIGEST_LENGTH;
 	int		 ret      = -1;
 
@@ -307,19 +296,18 @@ compute_binding_digest(X509_PUBKEY *spki, const char *principal,
 	if (spki_len <= 0)
 		return -1;
 
-	ctx = EVP_MD_CTX_new();
-	if (!ctx)
-		goto done;
-	if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) <= 0 ||
-	    EVP_DigestUpdate(ctx, spki_der, (size_t)spki_len) <= 0 ||
-	    EVP_DigestUpdate(ctx, BINDING_LABEL, strlen(BINDING_LABEL)) <= 0 ||
-	    EVP_DigestUpdate(ctx, principal, strlen(principal)) <= 0 ||
-	    EVP_DigestUpdate(ctx, &kvno_be, 4) <= 0 ||
-	    EVP_DigestFinal_ex(ctx, digest, &dlen) <= 0)
+	b = sshbuf_new();
+	if (b == NULL ||
+	    sshbuf_put(b, spki_der,     (size_t)spki_len)        != 0 ||
+	    sshbuf_put(b, BINDING_LABEL, strlen(BINDING_LABEL))  != 0 ||
+	    sshbuf_put(b, principal,    strlen(principal))        != 0 ||
+	    sshbuf_put(b, &kvno_be,     sizeof(kvno_be))          != 0 ||
+	    EVP_Q_digest(NULL, "SHA256", NULL,
+	        sshbuf_ptr(b), sshbuf_len(b), digest, &dlen) != 1)
 		goto done;
 	ret = 0;
 done:
-	EVP_MD_CTX_free(ctx);
+	sshbuf_free(b);
 	OPENSSL_free(spki_der);
 	return ret;
 }
@@ -481,30 +469,9 @@ done:
 static EVP_PKEY *
 generate_ephemeral_key(int fips_mode)
 {
-	EVP_PKEY     *pkey = NULL;
-	EVP_PKEY_CTX *ctx  = NULL;
-
-	if (!fips_mode) {
-		ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
-		if (!ctx)
-			return NULL;
-		if (EVP_PKEY_keygen_init(ctx) > 0)
-			EVP_PKEY_keygen(ctx, &pkey);
-	} else {
-		ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
-		if (!ctx)
-			return NULL;
-		OSSL_PARAM params[] = {
-			OSSL_PARAM_construct_utf8_string(
-			    OSSL_PKEY_PARAM_GROUP_NAME, "P-256", 0),
-			OSSL_PARAM_construct_end()
-		};
-		if (EVP_PKEY_keygen_init(ctx) > 0 &&
-		    EVP_PKEY_CTX_set_params(ctx, params) > 0)
-			EVP_PKEY_keygen(ctx, &pkey);
-	}
-	EVP_PKEY_CTX_free(ctx);
-	return pkey;
+	if (!fips_mode)
+		return EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
+	return EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
 }
 
 /* ------------------------------------------------------------------ *
@@ -562,17 +529,10 @@ add_pkinit_san(X509 *cert, const char *username, const char *realm)
 		goto done;
 	user_gs = NULL;  /* now owned by the stack */
 
-	/* DER-encode KRB5_PRINCIPAL_NAME */
-	pn_len = i2d_KRB5_PRINCIPAL_NAME(krb5pn, NULL);
+	/* DER-encode KRB5_PRINCIPAL_NAME; OpenSSL allocates when *pp == NULL */
+	pn_len = i2d_KRB5_PRINCIPAL_NAME(krb5pn, &pn_der);
 	if (pn_len <= 0)
 		goto done;
-	pn_der = malloc((size_t)pn_len);
-	if (!pn_der)
-		goto done;
-	{
-		unsigned char *p = pn_der;
-		i2d_KRB5_PRINCIPAL_NAME(krb5pn, &p);
-	}
 
 	/*
 	 * The otherName value is [0] EXPLICIT ANY where ANY = the encoded
@@ -646,7 +606,7 @@ done:
 	GENERAL_NAME_free(gen);
 	ASN1_OBJECT_free(san_oid);
 	ASN1_TYPE_free(san_val);
-	free(pn_der);
+	OPENSSL_free(pn_der);
 	return ret;
 }
 
@@ -780,6 +740,8 @@ ssh_gssapi_s4u_x509_build_cert(
 	int		 ib_len = 0,     ai_len = 0;
 	unsigned char	*cert_der = NULL;
 	int		 cert_der_len;
+	int		 key_id   = 0;
+	const EVP_MD	*sign_md  = NULL;
 	int		 ret = -1;
 
 	*cert_der_out     = NULL;
@@ -803,6 +765,8 @@ ssh_gssapi_s4u_x509_build_cert(
 		debug_f("S4U X.509: key derivation failed");
 		goto done;
 	}
+	key_id  = EVP_PKEY_base_id(derived_key);
+	sign_md = (key_id == EVP_PKEY_ED25519) ? NULL : EVP_sha256();
 
 	host_spki = sshkey_to_x509_pubkey(host_pubkey);
 	if (!host_spki) {
@@ -813,12 +777,10 @@ ssh_gssapi_s4u_x509_build_cert(
 	/* ---- Build id-ce-sshKerberosIssuerBinding ---- */
 	{
 		SSH_ISSUER_BINDING *ib;
-		unsigned char       digest[SHA256_DIGEST_LENGTH];
-		unsigned char      *sig = NULL;
-		size_t              siglen = 0;
-		EVP_MD_CTX         *mdctx = NULL;
-		int		    key_id;
-		const EVP_MD	   *md;
+		unsigned char   digest[SHA256_DIGEST_LENGTH];
+		unsigned char   sig[128]; /* Ed25519 = 64, ECDSA P-256 ≤ 72 */
+		size_t          siglen = sizeof(sig);
+		EVP_MD_CTX     *mdctx = NULL;
 
 		ib = SSH_ISSUER_BINDING_new();
 		if (!ib)
@@ -833,7 +795,6 @@ ssh_gssapi_s4u_x509_build_cert(
 			goto done;
 		}
 
-		key_id = EVP_PKEY_base_id(derived_key);
 		X509_ALGOR_set0(ib->sig_alg,
 		    OBJ_nid2obj(key_id == EVP_PKEY_ED25519
 		        ? NID_ED25519 : NID_ecdsa_with_SHA256),
@@ -857,30 +818,19 @@ ssh_gssapi_s4u_x509_build_cert(
 			SSH_ISSUER_BINDING_free(ib);
 			goto done;
 		}
-		md = (key_id == EVP_PKEY_ED25519) ? NULL : EVP_sha256();
-
-		if (EVP_DigestSignInit(mdctx, NULL, md, NULL,
+		if (EVP_DigestSignInit(mdctx, NULL, sign_md, NULL,
 		    derived_key) <= 0 ||
-		    EVP_DigestSign(mdctx, NULL, &siglen,
-		        digest, SHA256_DIGEST_LENGTH) <= 0 ||
-		    (sig = malloc(siglen)) == NULL ||
 		    EVP_DigestSign(mdctx, sig, &siglen,
 		        digest, SHA256_DIGEST_LENGTH) <= 0 ||
 		    !ASN1_STRING_set(ib->binding, sig, (int)siglen)) {
-			free(sig);
 			EVP_MD_CTX_free(mdctx);
 			ib->ssh_host_key = NULL;
 			SSH_ISSUER_BINDING_free(ib);
 			goto done;
 		}
-		free(sig);
 		EVP_MD_CTX_free(mdctx);
 
-		ib_len = i2d_SSH_ISSUER_BINDING(ib, NULL);
-		if (ib_len > 0 && (ib_der = malloc((size_t)ib_len)) != NULL) {
-			unsigned char *p = ib_der;
-			i2d_SSH_ISSUER_BINDING(ib, &p);
-		}
+		ib_len = i2d_SSH_ISSUER_BINDING(ib, &ib_der);
 		ib->ssh_host_key = NULL;
 		SSH_ISSUER_BINDING_free(ib);
 
@@ -925,11 +875,7 @@ ssh_gssapi_s4u_x509_build_cert(
 			}
 		}
 
-		ai_len = i2d_SSH_AUTHN_INFO(ai, NULL);
-		if (ai_len > 0 && (ai_der = malloc((size_t)ai_len)) != NULL) {
-			unsigned char *p = ai_der;
-			i2d_SSH_AUTHN_INFO(ai, &p);
-		}
+		ai_len = i2d_SSH_AUTHN_INFO(ai, &ai_der);
 		SSH_AUTHN_INFO_free(ai);
 
 		if (!ai_der || ai_len <= 0)
@@ -945,14 +891,10 @@ ssh_gssapi_s4u_x509_build_cert(
 
 	/* Random positive serial number */
 	{
-		unsigned char rnd[8];
-		RAND_bytes(rnd, sizeof(rnd));
-		rnd[0] &= 0x7f;
-		BIGNUM *bn = BN_bin2bn(rnd, sizeof(rnd), NULL);
-		if (bn) {
-			BN_to_ASN1_INTEGER(bn, X509_get_serialNumber(cert));
-			BN_free(bn);
-		}
+		uint64_t serial;
+		RAND_bytes((unsigned char *)&serial, sizeof(serial));
+		serial &= ~((uint64_t)1 << 63);	/* clear sign bit */
+		ASN1_INTEGER_set_uint64(X509_get_serialNumber(cert), serial);
 	}
 
 	{
@@ -1056,14 +998,9 @@ ssh_gssapi_s4u_x509_build_cert(
 	}
 
 	/* Sign with the derived attestation key */
-	{
-		int key_id = EVP_PKEY_base_id(derived_key);
-		const EVP_MD *md = (key_id == EVP_PKEY_ED25519)
-		    ? NULL : EVP_sha256();
-		if (X509_sign(cert, derived_key, md) <= 0) {
-			debug_f("S4U X.509: cert signing failed");
-			goto done;
-		}
+	if (X509_sign(cert, derived_key, sign_md) <= 0) {
+		debug_f("S4U X.509: cert signing failed");
+		goto done;
 	}
 
 	/* DER-encode the completed certificate */
@@ -1088,8 +1025,8 @@ ssh_gssapi_s4u_x509_build_cert(
 
 done:
 	free(principal);
-	free(ib_der);
-	free(ai_der);
+	OPENSSL_free(ib_der);
+	OPENSSL_free(ai_der);
 	free(cert_der);
 	EVP_PKEY_free(derived_key);
 	EVP_PKEY_free(subject_pkey);
