@@ -1,0 +1,11 @@
+test: ./runtest.sh
+framework: beakerlib
+require:
+  - iproute           # needs ip command
+  - procps-ng         # needs ps and pgrep commands
+  - initscripts       # needs service command
+  - openssh-clients   # needs ssh command
+  - findutils         # needs find command
+  - net-tools         # needs netstat command
+  - libselinux-utils  # needs selinuxenabled command
+  - nmap-ncat         # needs nc command

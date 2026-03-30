@@ -1,0 +1,11 @@
+summary: Basic sanity test for pam_ssh_agent_auth
+description: |
+  Created as a response to rhbz#1251777 and previous one rhbz#1225106.
+  The code of pam module is outdated and compiled with current openssh
+  version which went through quite enough refactoring.
+contact: Jakub Jelen <jjelen@redhat.com>
+require+:
+  - pam_ssh_agent_auth
+  - gcc               # needs to test pam_ssh_agent_auth
+  - pam-devel         # needs to test pam_ssh_agent_auth
+  - expect            # needs to test pam_ssh_agent_auth

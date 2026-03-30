@@ -1,0 +1,24 @@
+upstream_project_url: git@github.com:openssh/openssh-portable.git
+upstream_ref: V_10_2_P1
+downstream_package_name: openssh
+specfile_path: .distro/openssh.spec
+patch_generation_ignore_paths:
+- .distro
+patch_generation_patch_id_digits: 4
+sync_changelog: true
+files_to_sync:
+- src: .distro/
+  dest: .
+  delete: true
+  filters:
+  - protect .git*
+  - protect sources
+  - exclude source-git.yaml
+  - exclude .gitignore
+sources:
+- path: openssh-10.2p1.tar.gz
+  url: https://src.fedoraproject.org/repo/pkgs/rpms/openssh/openssh-10.2p1.tar.gz/sha512/66f3dd646179e71aaf41c33b6f14a207dc873d71d24f11c130a89dee317ee45398b818e5b94887b5913240964a38630d7bca3e481e0f1eff2e41d9e1cfdbdfc5/openssh-10.2p1.tar.gz
+- path: openssh-10.2p1.tar.gz.asc
+  url: https://src.fedoraproject.org/repo/pkgs/rpms/openssh/openssh-10.2p1.tar.gz.asc/sha512/f1f71700b1b0b2117aed505488b98b7ebb51ce26e53184b08df0b07aa2c5a1e54dc4d3cbcbe871b5ad849a2a0e22b02af318ff22a68c980ab53b04be03c9bf3c/openssh-10.2p1.tar.gz.asc
+- path: gpgkey-736060BA.gpg
+  url: https://src.fedoraproject.org/repo/pkgs/rpms/openssh/gpgkey-736060BA.gpg/sha512/df44f3fdbcd1d596705348c7f5aed3f738c5f626a55955e0642f7c6c082995cf36a1b1891bb41b8715cb2aff34fef1c877e0eff0d3507dd00a055ba695757a21/gpgkey-736060BA.gpg
