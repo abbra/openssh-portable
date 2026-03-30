@@ -606,6 +606,9 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 	gss_buffer_desc gssbuf, displayname = GSS_C_EMPTY_BUFFER;
 	char lname[NI_MAXHOST];
 	char *val;
+#if HAVE_DECL_GSS_KRB5_NT_X509_CERT
+	int user_name_from_x509 = 0;
+#endif
 
 	if (gethostname(lname, sizeof(lname)) != 0) {
 		logit_f("gethostname: %s", strerror(errno));
@@ -814,9 +817,11 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 				    GSS_KRB5_NT_X509_CERT, &user_name);
 				free(cert_der);
 				cert_der = NULL;
-				if (!GSS_ERROR(major))
+				if (!GSS_ERROR(major)) {
 					debug_f("S4U X.509 cert imported for "
 					    "user %.100s", user);
+					user_name_from_x509 = 1;
+				}
 				else {
 					logit_f("gss_import_name (X.509 cert)"
 					    " failed; falling back to username");
@@ -870,6 +875,28 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 		gss_release_name(&minor, &user_name);
 		return -1;
 	}
+
+	/*
+	 * If the user was imported as a GSS_KRB5_NT_X509_CERT name,
+	 * gss_display_name would return the raw cert DER bytes, producing
+	 * garbage in the ccache principal.  Re-import as GSS_C_NT_USER_NAME
+	 * so the display and exported names are the canonical principal string.
+	 */
+#if HAVE_DECL_GSS_KRB5_NT_X509_CERT
+	if (user_name_from_x509) {
+		gss_release_name(&minor, &user_name);
+		user_name = GSS_C_NO_NAME;
+		gssbuf.value = (void *)user;
+		gssbuf.length = strlen(user);
+		major = gss_import_name(&minor, &gssbuf,
+		    GSS_C_NT_USER_NAME, &user_name);
+		if (GSS_ERROR(major)) {
+			logit_f("gss_import_name (user, after X.509 S4U) failed");
+			gss_release_cred(&minor, &impersonated_creds);
+			return -1;
+		}
+	}
+#endif
 
 	/* Get the display name (Kerberos principal string) for storecreds */
 	major = gss_display_name(&minor, user_name, &displayname, NULL);
