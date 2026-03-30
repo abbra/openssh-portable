@@ -738,6 +738,9 @@ ssh_gssapi_s4u_x509_get_keytab_key(
 	*enctype_out = best.key.enctype;
 	*kvno_out    = (uint32_t)best.vno;
 	krb5_free_keytab_entry_contents(ctx, &best);
+	debug_f("S4U X.509: selected keytab entry enctype=%d kvno=%u "
+	    "keylen=%zu for host/%s@%s",
+	    (int)*enctype_out, *kvno_out, *ikm_len_out, hostname, realm);
 	ret = 0;
 
 done:
@@ -1078,6 +1081,9 @@ ssh_gssapi_s4u_x509_build_cert(
 	*cert_der_out     = cert_der;
 	*cert_der_len_out = (size_t)cert_der_len;
 	cert_der = NULL;
+	debug_f("S4U X.509: built attestation cert for user %.100s "
+	    "realm %.64s method %.32s (%d bytes)",
+	    user, realm, auth_method, cert_der_len);
 	ret = 0;
 
 done:

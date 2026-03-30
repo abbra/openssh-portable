@@ -710,6 +710,9 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 			}
 
 			if (realm != NULL && *realm != '\0') {
+				debug_f("S4U X.509: attempting attestation "
+				    "for user %.100s, host realm %.64s "
+				    "fips=%d", user, realm, fips_mode);
 				ssh_gssapi_s4u_x509_get_keytab_key(kctx,
 				    lname, realm, fips_mode,
 				    &ikm, &ikm_len, &enctype, &kvno);
@@ -731,6 +734,11 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 			}
 		}
 
+		if (ikm != NULL && !same_realm) {
+			debug_f("S4U X.509: skipping attestation for "
+			    "cross-realm user %.100s (host realm %.64s)",
+			    user, realm ? realm : "(unknown)");
+		}
 		if (ikm != NULL && same_realm) {
 			/* Prefer non-Ed25519 host keys in FIPS mode */
 			const struct sshkey *host_pubkey =
