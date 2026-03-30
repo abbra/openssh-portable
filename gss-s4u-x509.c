@@ -57,6 +57,7 @@
 #include <openssl/asn1.h>
 #include <openssl/asn1t.h>
 #include <openssl/rand.h>
+#include <openssl/err.h>
 
 #include <krb5.h>
 
@@ -81,8 +82,9 @@
 #define BINDING_LABEL            "ssh-attestation-binding-v1"
 #define HKDF_SALT                "ssh-attestation-v1"
 
-/* Keytab path — same one gss_acquire_cred_from uses */
-#define SSH_KEYTAB_PATH          "/etc/krb5.keytab"
+
+/* Maximum lifetime for attestation certificates (seconds) */
+#define SSH_S4U_CERT_LIFETIME_MAX 300u
 
 /*
  * Preference order for keytab enctype (higher = more preferred).
@@ -92,10 +94,10 @@ static int
 enctype_preference(krb5_enctype e)
 {
 	switch (e) {
-	case 20: return 4;	/* AES256-CTS-HMAC-SHA384-192 */
-	case 19: return 3;	/* AES128-CTS-HMAC-SHA384-192 */
-	case 18: return 2;	/* AES256-CTS-HMAC-SHA1-96 */
-	case 17: return 1;	/* AES128-CTS-HMAC-SHA1-96 */
+	case 20: return 4;	/* AES256-CTS-HMAC-SHA384-192 (RFC 8009) */
+	case 19: return 3;	/* AES128-CTS-HMAC-SHA256-128 (RFC 8009) */
+	case 18: return 2;	/* AES256-CTS-HMAC-SHA1-96    (RFC 3962) */
+	case 17: return 1;	/* AES128-CTS-HMAC-SHA1-96    (RFC 3962) */
 	default: return 0;
 	}
 }
@@ -114,26 +116,34 @@ hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
 	int		 ret  = -1;
 
 	kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
-	if (!kdf)
+	if (!kdf) {
+		error_f("S4U X.509: EVP_KDF_fetch(HKDF) failed: %s",
+		    ERR_reason_error_string(ERR_get_error()));
 		goto done;
+	}
 	kctx = EVP_KDF_CTX_new(kdf);
-	if (!kctx)
+	if (!kctx) {
+		error_f("S4U X.509: EVP_KDF_CTX_new failed");
 		goto done;
-
-	OSSL_PARAM params[] = {
-		OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
-		    "SHA256", 0),
-		OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY,
-		    (void *)ikm, ikm_len),
-		OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
-		    (void *)salt, salt_len),
-		OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO,
-		    (void *)info, info_len),
-		OSSL_PARAM_construct_end()
-	};
-
-	if (EVP_KDF_derive(kctx, out, out_len, params) > 0)
-		ret = 0;
+	}
+	{
+		OSSL_PARAM params[] = {
+			OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
+			    "SHA256", 0),
+			OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY,
+			    (void *)ikm, ikm_len),
+			OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
+			    (void *)salt, salt_len),
+			OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO,
+			    (void *)info, info_len),
+			OSSL_PARAM_construct_end()
+		};
+		if (EVP_KDF_derive(kctx, out, out_len, params) > 0)
+			ret = 0;
+		else
+			error_f("S4U X.509: EVP_KDF_derive failed: %s",
+			    ERR_reason_error_string(ERR_get_error()));
+	}
 done:
 	EVP_KDF_CTX_free(kctx);
 	EVP_KDF_free(kdf);
@@ -178,6 +188,14 @@ derive_p256_key(const unsigned char *seed48)
 
 	if (!ctx || !raw || !n || !nm1 || !k)
 		goto out;
+	/*
+	 * raw is HKDF output derived from a secret keytab key.
+	 * BN_FLG_CONSTTIME asks OpenSSL to prefer constant-time paths
+	 * when raw is an operand.  BN_mod itself may not be fully
+	 * constant-time in all OpenSSL versions; server-side exposure
+	 * limits practical risk, but we set the flag as best effort.
+	 */
+	BN_set_flags(raw, BN_FLG_CONSTTIME);
 	if (!BN_copy(nm1, n) || !BN_sub_word(nm1, 1) ||
 	    !BN_mod(k, raw, nm1, ctx) || !BN_add_word(k, 1) ||
 	    BN_bn2binpad(k, kbytes, 32) != 32)
@@ -192,7 +210,10 @@ derive_p256_key(const unsigned char *seed48)
 			    OSSL_PKEY_PARAM_PRIV_KEY, kbytes, 32),
 			OSSL_PARAM_construct_end()
 		};
-		EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEYPAIR, params);
+		if (EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEYPAIR,
+		    params) <= 0)
+			error_f("S4U X.509: EVP_PKEY_fromdata failed: %s",
+			    ERR_reason_error_string(ERR_get_error()));
 	}
 out:
 	OPENSSL_cleanse(kbytes, sizeof(kbytes));
@@ -227,14 +248,20 @@ derive_attestation_key(const unsigned char *ikm, size_t ikm_len,
 	if (info == NULL ||
 	    sshbuf_put(info, hostname, strlen(hostname) + 1) != 0 ||
 	    sshbuf_put(info, realm,    strlen(realm)    + 1) != 0 ||
-	    sshbuf_put(info, &kvno_be, sizeof(kvno_be))      != 0 ||
-	    hkdf_sha256(ikm, ikm_len, HKDF_SALT, strlen(HKDF_SALT),
-	        sshbuf_ptr(info), sshbuf_len(info), seed, seed_len) != 0)
+	    sshbuf_put(info, &kvno_be, sizeof(kvno_be))      != 0) {
+		error_f("S4U X.509: HKDF info assembly failed");
 		goto done;
+	}
+	if (hkdf_sha256(ikm, ikm_len, HKDF_SALT, strlen(HKDF_SALT),
+	    sshbuf_ptr(info), sshbuf_len(info), seed, seed_len) != 0)
+		goto done; /* hkdf_sha256 logs its own errors */
 
 	pkey = fips_mode
 	    ? derive_p256_key(seed)
 	    : EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, seed, 32);
+	if (pkey == NULL)
+		error_f("S4U X.509: %s key construction failed",
+		    fips_mode ? "P-256" : "Ed25519");
 
 done:
 	sshbuf_free(info);
@@ -249,21 +276,22 @@ done:
 static X509_PUBKEY *
 sshkey_to_x509_pubkey(const struct sshkey *key)
 {
-	EVP_PKEY	*pkey      = NULL;
-	X509_PUBKEY	*spki      = NULL;
-	int		 need_free = 0;
+	EVP_PKEY	*pkey = NULL;
+	X509_PUBKEY	*spki = NULL;
 
 	switch (key->type) {
 	case KEY_RSA:
 	case KEY_ECDSA:
+		/* Take a reference so ownership is uniform below */
 		pkey = key->pkey;
+		if (!EVP_PKEY_up_ref(pkey))
+			return NULL;
 		break;
 	case KEY_ED25519:
 		if (!key->ed25519_pk)
 			return NULL;
 		pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
 		    key->ed25519_pk, ED25519_PK_SZ);
-		need_free = 1;
 		break;
 	default:
 		return NULL;
@@ -271,15 +299,26 @@ sshkey_to_x509_pubkey(const struct sshkey *key)
 	if (!pkey)
 		return NULL;
 
-	X509_PUBKEY_set(&spki, pkey);
-	if (need_free)
+	if (X509_PUBKEY_set(&spki, pkey) != 1) {
 		EVP_PKEY_free(pkey);
+		return NULL;
+	}
+	EVP_PKEY_free(pkey);
 	return spki;
 }
 
 /* ------------------------------------------------------------------ *
  * Compute binding digest:
  *   SHA256(sshHostKey_SPKI_DER || BINDING_LABEL || principal || kvno_be32)
+ *
+ * Collision-resistance note: the concatenation lacks explicit length
+ * prefixes on variable-length fields, but collision is not achievable
+ * with current fields because:
+ *   - spki_der is DER (self-delimiting, starts with 30 82 / 30 81)
+ *   - BINDING_LABEL is a fixed-length constant string
+ *   - principal has the form "host/name@REALM" (always contains '/')
+ *   - kvno_be32 is a fixed 4-byte suffix
+ * If new variable-length fields are added, length framing must be added.
  * ------------------------------------------------------------------ */
 static int
 compute_binding_digest(X509_PUBKEY *spki, const char *principal,
@@ -289,7 +328,7 @@ compute_binding_digest(X509_PUBKEY *spki, const char *principal,
 	int		 spki_len;
 	uint32_t	 kvno_be  = htonl(kvno);
 	struct sshbuf	*b        = NULL;
-	unsigned int	 dlen     = SHA256_DIGEST_LENGTH;
+	size_t		 dlen     = SHA256_DIGEST_LENGTH;
 	int		 ret      = -1;
 
 	spki_len = i2d_X509_PUBKEY(spki, &spki_der);
@@ -488,7 +527,6 @@ add_pkinit_san(X509 *cert, const char *username, const char *realm)
 	ASN1_GENERALSTRING   *user_gs  = NULL;
 	GENERAL_NAMES        *gens     = NULL;
 	GENERAL_NAME         *gen      = NULL;
-	ASN1_OBJECT          *san_oid  = NULL;
 	ASN1_TYPE            *san_val  = NULL;
 	unsigned char        *pn_der   = NULL;
 	int                   pn_len;
@@ -535,46 +573,15 @@ add_pkinit_san(X509 *cert, const char *username, const char *realm)
 		goto done;
 
 	/*
-	 * The otherName value is [0] EXPLICIT ANY where ANY = the encoded
-	 * KRB5PrincipalName SEQUENCE.  OpenSSL's OTHERNAME.value is an
-	 * ASN1_TYPE; set it to V_ASN1_SEQUENCE with the DER content bytes
-	 * (i.e. the SEQUENCE contents, not including the outer tag+len that
-	 * OpenSSL will re-add when encoding the OTHERNAME).
-	 *
-	 * We store the full DER (tag + len + contents) as V_ASN1_SEQUENCE
-	 * data; OpenSSL re-wraps it correctly inside the otherName encoding.
-	 */
-	san_val = ASN1_TYPE_new();
-	if (!san_val)
-		goto done;
-	san_val->type = V_ASN1_SEQUENCE;
-	san_val->value.sequence = ASN1_STRING_new();
-	if (!san_val->value.sequence)
-		goto done;
-	/*
-	 * Strip the outer SEQUENCE tag+len from pn_der so that OpenSSL's
-	 * ASN1_TYPE V_ASN1_SEQUENCE stores only the contents bytes; it will
-	 * re-add tag 0x30 and the length when serialising the OTHERNAME.
+	 * d2i_ASN1_TYPE parses the full DER: reads the SEQUENCE tag+len and
+	 * stores only the contents in value.sequence.  OpenSSL re-adds the
+	 * 0x30 wrapper when serialising the OTHERNAME value field.
 	 */
 	{
 		const unsigned char *p = pn_der;
-		long contents_len;
-		int tag, cls;
-		int hdr_len;
-
-		/* Peek at the outer tag/length to find where contents begin */
-		hdr_len = ASN1_get_object(&p, &contents_len, &tag, &cls,
-		    pn_len);
-		if (hdr_len & 0x80 || tag != V_ASN1_SEQUENCE)
-			goto done;
-		/* p now points at the contents; contents_len is their length */
-		if (!ASN1_STRING_set(san_val->value.sequence,
-		    p, (int)contents_len))
-			goto done;
+		san_val = d2i_ASN1_TYPE(NULL, &p, (long)pn_len);
 	}
-
-	san_oid = OBJ_txt2obj(OID_PKINIT_SAN, 1);
-	if (!san_oid)
+	if (!san_val || san_val->type != V_ASN1_SEQUENCE)
 		goto done;
 
 	gen = GENERAL_NAME_new();
@@ -584,8 +591,9 @@ add_pkinit_san(X509 *cert, const char *username, const char *realm)
 	gen->d.otherName = OTHERNAME_new();
 	if (!gen->d.otherName)
 		goto done;
-	gen->d.otherName->type_id = san_oid;
-	san_oid = NULL;
+	gen->d.otherName->type_id = OBJ_txt2obj(OID_PKINIT_SAN, 1);
+	if (!gen->d.otherName->type_id)
+		goto done;
 	gen->d.otherName->value = san_val;
 	san_val = NULL;
 
@@ -604,7 +612,6 @@ done:
 	ASN1_GENERALSTRING_free(user_gs);
 	GENERAL_NAMES_free(gens);
 	GENERAL_NAME_free(gen);
-	ASN1_OBJECT_free(san_oid);
 	ASN1_TYPE_free(san_val);
 	OPENSSL_free(pn_der);
 	return ret;
@@ -638,14 +645,14 @@ ssh_gssapi_s4u_x509_get_keytab_key(
 
 	xasprintf(&princ_str, "host/%s@%s", hostname, realm);
 	if (krb5_parse_name(ctx, princ_str, &host_princ) != 0) {
-		debug_f("S4U X.509: cannot parse host principal %s", princ_str);
+		debug2_f("S4U X.509: cannot parse host principal %s", princ_str);
 		free(princ_str);
 		return -1;
 	}
 	free(princ_str);
 
-	if (krb5_kt_resolve(ctx, SSH_KEYTAB_PATH, &kt) != 0) {
-		debug_f("S4U X.509: cannot open keytab %s", SSH_KEYTAB_PATH);
+	if (krb5_kt_default(ctx, &kt) != 0) {
+		debug2_f("S4U X.509: cannot open default keytab");
 		krb5_free_principal(ctx, host_princ);
 		return -1;
 	}
@@ -667,7 +674,8 @@ ssh_gssapi_s4u_x509_get_keytab_key(
 		}
 		if (fips_mode && (entry.key.enctype == 17 ||
 		    entry.key.enctype == 19)) {
-			/* AES-128 enctypes rejected in FIPS mode */
+			debug2_f("S4U X.509: skipping enctype %d (AES-128 "
+			    "rejected in FIPS mode)", entry.key.enctype);
 			krb5_free_keytab_entry_contents(ctx, &entry);
 			continue;
 		}
@@ -684,10 +692,15 @@ ssh_gssapi_s4u_x509_get_keytab_key(
 	krb5_kt_end_seq_get(ctx, kt, &cursor);
 
 	if (!have_best) {
-		debug_f("S4U X.509: no suitable keytab entry found");
+		debug2_f("S4U X.509: no suitable keytab entry found");
 		goto done;
 	}
 
+	if (best.key.length == 0) {
+		debug2_f("S4U X.509: keytab entry has zero-length key material");
+		krb5_free_keytab_entry_contents(ctx, &best);
+		goto done;
+	}
 	*ikm_len_out = (size_t)best.key.length;
 	*ikm_out = malloc(*ikm_len_out);
 	if (!*ikm_out) {
@@ -698,7 +711,7 @@ ssh_gssapi_s4u_x509_get_keytab_key(
 	*enctype_out = best.key.enctype;
 	*kvno_out    = (uint32_t)best.vno;
 	krb5_free_keytab_entry_contents(ctx, &best);
-	debug_f("S4U X.509: selected keytab entry enctype=%d kvno=%u "
+	debug2_f("S4U X.509: selected keytab entry enctype=%d kvno=%u "
 	    "keylen=%zu for host/%s@%s",
 	    (int)*enctype_out, *kvno_out, *ikm_len_out, hostname, realm);
 	ret = 0;
@@ -752,17 +765,21 @@ ssh_gssapi_s4u_x509_build_cert(
 	/* In FIPS mode, Ed25519 client keys cannot go into a SPKI */
 	if (fips_mode && auth_method_key != NULL &&
 	    auth_method_key->type == KEY_ED25519) {
-		debug_f("S4U X.509: Ed25519 client key not usable in FIPS "
-		    "mode; falling back to plain S4U2Self");
+		debug2_f("S4U X.509: Ed25519 client key not usable in FIPS "
+		    "mode; skipping attestation");
 		return -1;
 	}
+
+	/* Attestation certificates are short-lived regardless of GSS lifetime */
+	if (cert_lifetime > SSH_S4U_CERT_LIFETIME_MAX)
+		cert_lifetime = SSH_S4U_CERT_LIFETIME_MAX;
 
 	xasprintf(&principal, "host/%s@%s", hostname, realm);
 
 	derived_key = derive_attestation_key(ikm, ikm_len,
 	    hostname, realm, kvno, fips_mode);
 	if (!derived_key) {
-		debug_f("S4U X.509: key derivation failed");
+		/* derive_attestation_key logs the specific failure */
 		goto done;
 	}
 	key_id  = EVP_PKEY_base_id(derived_key);
@@ -770,7 +787,7 @@ ssh_gssapi_s4u_x509_build_cert(
 
 	host_spki = sshkey_to_x509_pubkey(host_pubkey);
 	if (!host_spki) {
-		debug_f("S4U X.509: cannot convert host key to SPKI");
+		debug2_f("S4U X.509: cannot convert host key to SPKI");
 		goto done;
 	}
 
@@ -795,10 +812,18 @@ ssh_gssapi_s4u_x509_build_cert(
 			goto done;
 		}
 
-		X509_ALGOR_set0(ib->sig_alg,
-		    OBJ_nid2obj(key_id == EVP_PKEY_ED25519
-		        ? NID_ED25519 : NID_ecdsa_with_SHA256),
-		    V_ASN1_UNDEF, NULL);
+		{
+			ASN1_OBJECT *sig_obj = OBJ_nid2obj(
+			    key_id == EVP_PKEY_ED25519
+			    ? NID_ED25519 : NID_ecdsa_with_SHA256);
+			if (sig_obj == NULL ||
+			    !X509_ALGOR_set0(ib->sig_alg, sig_obj,
+			    V_ASN1_UNDEF, NULL)) {
+				ASN1_OBJECT_free(sig_obj);
+				SSH_ISSUER_BINDING_free(ib);
+				goto done;
+			}
+		}
 
 		/* Transfer host_spki ownership into ib */
 		X509_PUBKEY_free(ib->ssh_host_key);
@@ -807,6 +832,12 @@ ssh_gssapi_s4u_x509_build_cert(
 
 		if (compute_binding_digest(ib->ssh_host_key, principal,
 		    kvno, digest) != 0) {
+			OPENSSL_cleanse(digest, sizeof(digest));
+			/*
+			 * ssh_host_key was transferred into ib; NULL it before
+			 * SSH_ISSUER_BINDING_free to prevent double-free of the
+			 * X509_PUBKEY via both host_spki and ib cleanup paths.
+			 */
 			ib->ssh_host_key = NULL;
 			SSH_ISSUER_BINDING_free(ib);
 			goto done;
@@ -814,7 +845,8 @@ ssh_gssapi_s4u_x509_build_cert(
 
 		mdctx = EVP_MD_CTX_new();
 		if (!mdctx) {
-			ib->ssh_host_key = NULL;
+			OPENSSL_cleanse(digest, sizeof(digest));
+			ib->ssh_host_key = NULL; /* see above */
 			SSH_ISSUER_BINDING_free(ib);
 			goto done;
 		}
@@ -824,14 +856,18 @@ ssh_gssapi_s4u_x509_build_cert(
 		        digest, SHA256_DIGEST_LENGTH) <= 0 ||
 		    !ASN1_STRING_set(ib->binding, sig, (int)siglen)) {
 			EVP_MD_CTX_free(mdctx);
-			ib->ssh_host_key = NULL;
+			OPENSSL_cleanse(sig, sizeof(sig));
+			OPENSSL_cleanse(digest, sizeof(digest));
+			ib->ssh_host_key = NULL; /* see above */
 			SSH_ISSUER_BINDING_free(ib);
 			goto done;
 		}
 		EVP_MD_CTX_free(mdctx);
+		OPENSSL_cleanse(sig, sizeof(sig));
+		OPENSSL_cleanse(digest, sizeof(digest));
 
 		ib_len = i2d_SSH_ISSUER_BINDING(ib, &ib_der);
-		ib->ssh_host_key = NULL;
+		ib->ssh_host_key = NULL; /* see above */
 		SSH_ISSUER_BINDING_free(ib);
 
 		if (!ib_der || ib_len <= 0)
@@ -847,6 +883,10 @@ ssh_gssapi_s4u_x509_build_cert(
 		const unsigned char *sid     = sshbuf_ptr(session_id_buf);
 		size_t		     sid_len = sshbuf_len(session_id_buf);
 
+		if (sid_len > INT_MAX) {
+			SSH_AUTHN_INFO_free(ai);
+			goto done;
+		}
 		if (!ASN1_INTEGER_set(ai->version, 0) ||
 		    !ASN1_STRING_set(ai->auth_method, auth_method,
 		        (int)strlen(auth_method)) ||
@@ -887,14 +927,24 @@ ssh_gssapi_s4u_x509_build_cert(
 	if (!cert)
 		goto done;
 
-	X509_set_version(cert, X509_VERSION_3);
+	if (X509_set_version(cert, X509_VERSION_3) != 1) {
+		error_f("S4U X.509: X509_set_version failed");
+		goto done;
+	}
 
 	/* Random positive serial number */
 	{
-		uint64_t serial;
-		RAND_bytes((unsigned char *)&serial, sizeof(serial));
+		uint64_t serial = 0;
+		if (RAND_bytes((unsigned char *)&serial, sizeof(serial)) != 1) {
+			error_f("S4U X.509: RAND_bytes failed");
+			goto done;
+		}
 		serial &= ~((uint64_t)1 << 63);	/* clear sign bit */
-		ASN1_INTEGER_set_uint64(X509_get_serialNumber(cert), serial);
+		if (!ASN1_INTEGER_set_uint64(X509_get_serialNumber(cert),
+		    serial)) {
+			error_f("S4U X.509: ASN1_INTEGER_set_uint64 failed");
+			goto done;
+		}
 	}
 
 	{
@@ -905,101 +955,134 @@ ssh_gssapi_s4u_x509_build_cert(
 	}
 
 	/* Issuer: CN = "host/hostname@REALM" */
-	X509_NAME_add_entry_by_NID(X509_get_issuer_name(cert),
+	if (X509_NAME_add_entry_by_NID(X509_get_issuer_name(cert),
 	    NID_commonName, MBSTRING_UTF8,
-	    (unsigned char *)principal, (int)strlen(principal), -1, 0);
+	    (unsigned char *)principal, (int)strlen(principal), -1, 0) != 1) {
+		error_f("S4U X.509: failed to set Issuer CN");
+		goto done;
+	}
 
 	/* Subject: CN = user */
-	X509_NAME_add_entry_by_NID(X509_get_subject_name(cert),
+	if (X509_NAME_add_entry_by_NID(X509_get_subject_name(cert),
 	    NID_commonName, MBSTRING_UTF8,
-	    (unsigned char *)user, (int)strlen(user), -1, 0);
+	    (unsigned char *)user, (int)strlen(user), -1, 0) != 1) {
+		error_f("S4U X.509: failed to set Subject CN");
+		goto done;
+	}
 
 	/* SubjectPublicKeyInfo */
 	if (auth_method_key != NULL &&
 	    (auth_method_key->type == KEY_RSA ||
 	     auth_method_key->type == KEY_ECDSA)) {
-		X509_set_pubkey(cert, auth_method_key->pkey);
+		if (X509_set_pubkey(cert, auth_method_key->pkey) != 1) {
+			error_f("S4U X.509: X509_set_pubkey failed for "
+			    "RSA/ECDSA client key");
+			goto done;
+		}
 	} else if (auth_method_key != NULL &&
 	    auth_method_key->type == KEY_ED25519 && !fips_mode) {
 		EVP_PKEY *epkey = EVP_PKEY_new_raw_public_key(
 		    EVP_PKEY_ED25519, NULL,
 		    auth_method_key->ed25519_pk, ED25519_PK_SZ);
-		if (epkey) {
-			X509_set_pubkey(cert, epkey);
-			EVP_PKEY_free(epkey);
+		if (epkey == NULL) {
+			error_f("S4U X.509: EVP_PKEY_new_raw_public_key "
+			    "failed for Ed25519 client key");
+			goto done;
+		}
+		int r = X509_set_pubkey(cert, epkey);
+		EVP_PKEY_free(epkey);
+		if (r != 1) {
+			error_f("S4U X.509: X509_set_pubkey failed for "
+			    "Ed25519 client key");
+			goto done;
 		}
 	} else {
 		subject_pkey = generate_ephemeral_key(fips_mode);
-		if (!subject_pkey)
+		if (!subject_pkey) {
+			error_f("S4U X.509: generate_ephemeral_key failed");
 			goto done;
-		X509_set_pubkey(cert, subject_pkey);
+		}
+		if (X509_set_pubkey(cert, subject_pkey) != 1) {
+			error_f("S4U X.509: X509_set_pubkey failed for "
+			    "ephemeral key");
+			goto done;
+		}
 	}
 
 	/* basicConstraints: CA:FALSE (critical) */
 	{
-		X509V3_CTX v3ctx;
-		X509V3_set_ctx_nodb(&v3ctx);
-		X509V3_set_ctx(&v3ctx, NULL, cert, NULL, NULL, 0);
-		X509_EXTENSION *bc = X509V3_EXT_conf_nid(NULL, &v3ctx,
+		X509_EXTENSION *bc = X509V3_EXT_conf_nid(NULL, NULL,
 		    NID_basic_constraints, "critical,CA:FALSE");
-		if (bc) {
-			X509_add_ext(cert, bc, -1);
+		if (bc == NULL || X509_add_ext(cert, bc, -1) != 1) {
+			error_f("S4U X.509: failed to add basicConstraints");
 			X509_EXTENSION_free(bc);
+			goto done;
 		}
+		X509_EXTENSION_free(bc);
 	}
 
 	/* keyUsage: digitalSignature (critical) */
 	{
-		X509V3_CTX v3ctx;
-		X509V3_set_ctx_nodb(&v3ctx);
-		X509V3_set_ctx(&v3ctx, NULL, cert, NULL, NULL, 0);
-		X509_EXTENSION *ku = X509V3_EXT_conf_nid(NULL, &v3ctx,
+		X509_EXTENSION *ku = X509V3_EXT_conf_nid(NULL, NULL,
 		    NID_key_usage, "critical,digitalSignature");
-		if (ku) {
-			X509_add_ext(cert, ku, -1);
+		if (ku == NULL || X509_add_ext(cert, ku, -1) != 1) {
+			error_f("S4U X.509: failed to add keyUsage");
 			X509_EXTENSION_free(ku);
+			goto done;
 		}
+		X509_EXTENSION_free(ku);
 	}
 
-	/* extKeyUsage: id-pkinit-KPClientAuth */
+	/* extKeyUsage: id-pkinit-KPClientAuth (required by RFC 4556) */
 	{
 		ASN1_OBJECT *eku_obj =
 		    OBJ_txt2obj(OID_PKINIT_KP_CLIENTAUTH, 1);
-		if (eku_obj) {
-			EXTENDED_KEY_USAGE *eku = sk_ASN1_OBJECT_new_null();
-			if (eku) {
+		EXTENDED_KEY_USAGE *eku = NULL;
+		int eku_ok = 0;
+
+		if (eku_obj != NULL) {
+			eku = sk_ASN1_OBJECT_new_null();
+			if (eku != NULL) {
 				sk_ASN1_OBJECT_push(eku, eku_obj);
 				eku_obj = NULL;
-				X509_add1_ext_i2d(cert, NID_ext_key_usage,
-				    eku, 0, 0);
+				if (X509_add1_ext_i2d(cert, NID_ext_key_usage,
+				    eku, 0, 0) == 1)
+					eku_ok = 1;
 				sk_ASN1_OBJECT_pop_free(eku, ASN1_OBJECT_free);
-			} else {
-				ASN1_OBJECT_free(eku_obj);
 			}
+		}
+		ASN1_OBJECT_free(eku_obj);
+		if (!eku_ok) {
+			error_f("S4U X.509: failed to add extKeyUsage "
+			    "(id-pkinit-KPClientAuth)");
+			goto done;
 		}
 	}
 
-	/* subjectAltName: id-pkinit-san (critical) */
-	if (add_pkinit_san(cert, user, realm) != 0)
-		debug_f("S4U X.509: warning: failed to add PKINIT SAN");
+	/* subjectAltName: id-pkinit-san (critical — KDC identifies principal by this) */
+	if (add_pkinit_san(cert, user, realm) != 0) {
+		error_f("S4U X.509: failed to add PKINIT SAN; "
+		    "aborting attestation cert");
+		goto done;
+	}
 
 	/* id-ce-sshKerberosIssuerBinding */
 	if (add_raw_extension(cert, OID_SSH_ISSUER_BINDING, 0,
 	    ib_der, ib_len) != 0) {
-		debug_f("S4U X.509: cannot add issuer binding extension");
+		error_f("S4U X.509: cannot add issuer binding extension");
 		goto done;
 	}
 
 	/* id-ce-sshAuthnInfo */
 	if (add_raw_extension(cert, OID_SSH_AUTHN_INFO, 0,
 	    ai_der, ai_len) != 0) {
-		debug_f("S4U X.509: cannot add authn info extension");
+		error_f("S4U X.509: cannot add authn info extension");
 		goto done;
 	}
 
 	/* Sign with the derived attestation key */
 	if (X509_sign(cert, derived_key, sign_md) <= 0) {
-		debug_f("S4U X.509: cert signing failed");
+		error_f("S4U X.509: cert signing failed");
 		goto done;
 	}
 
@@ -1012,7 +1095,12 @@ ssh_gssapi_s4u_x509_build_cert(
 		goto done;
 	{
 		unsigned char *p = cert_der;
-		i2d_X509(cert, &p);
+		int written = i2d_X509(cert, &p);
+		if (written != cert_der_len) {
+			error_f("S4U X.509: i2d_X509 length mismatch "
+			    "(%d vs %d)", written, cert_der_len);
+			goto done;
+		}
 	}
 
 	*cert_der_out     = cert_der;

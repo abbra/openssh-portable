@@ -35,6 +35,7 @@
 struct sshbuf;
 struct sshkey;
 
+
 /*
  * Read the host keytab and locate the best entry for host/hostname@REALM.
  * Enctype preference order: 20 > 19 > 18 > 17; others are rejected.
