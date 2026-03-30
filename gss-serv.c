@@ -669,10 +669,10 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 	 *   - the cert cannot be built (keytab missing, FIPS constraints, ...)
 	 *   - the user's realm differs from the host realm (cross-realm: the
 	 *     KDC does not call get_s4u_x509_principal for foreign realms)
-	 *   - GSS_KRB5_NT_X509_CERT is not defined in the installed krb5
+	 *   - GSS_KRB5_NT_X509_CERT is not declared in the installed krb5 headers
 	 */
 #if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL) && \
-    defined(GSS_KRB5_NT_X509_CERT)
+    HAVE_DECL_GSS_KRB5_NT_X509_CERT
 	if (ssh != NULL && authctxt != NULL &&
 	    ssh->kex != NULL && ssh->kex->session_id != NULL) {
 		krb5_context kctx = NULL;
@@ -832,11 +832,11 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 		if (kctx != NULL)
 			krb5_free_context(kctx);
 	}
-#else /* !(KRB5 && !HEIMDAL && WITH_OPENSSL && GSS_KRB5_NT_X509_CERT) */
+#else /* !(KRB5 && !HEIMDAL && WITH_OPENSSL && HAVE_DECL_GSS_KRB5_NT_X509_CERT) */
 	debug_f("S4U X.509 attestation not compiled in "
 	    "(missing KRB5, OPENSSL, or GSS_KRB5_NT_X509_CERT); "
 	    "using plain S4U2Self");
-#endif /* KRB5 && !HEIMDAL && WITH_OPENSSL && GSS_KRB5_NT_X509_CERT */
+#endif /* KRB5 && !HEIMDAL && WITH_OPENSSL && HAVE_DECL_GSS_KRB5_NT_X509_CERT */
 
 	/* Plain username fallback (cross-realm, no keytab, or cert failed) */
 	if (user_name == GSS_C_NO_NAME) {
