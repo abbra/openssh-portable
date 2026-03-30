@@ -683,8 +683,11 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 		unsigned char *cert_der = NULL;
 		size_t cert_der_len = 0;
 		const char *realm = NULL;
+		char realm_buf[256];
 		int same_realm = 0;
 		int fips_mode = EVP_default_properties_is_fips_enabled(NULL);
+
+		realm_buf[0] = '\0';
 
 		debug_f("S4U X.509: entered attestation path for user %.100s "
 		    "fips=%d", user, fips_mode);
@@ -699,8 +702,6 @@ ssh_gssapi_s4u2self(const char *user, u_int lifetime,
 			    "falling back to plain S4U2Self");
 		} else {
 			krb5_principal host_princ = NULL;
-			static char realm_buf[256];
-			realm_buf[0] = '\0';
 
 			if (krb5_sname_to_principal(kctx, lname, "host",
 			    KRB5_NT_SRV_HST, &host_princ) != 0) {
