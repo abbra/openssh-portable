@@ -38,8 +38,8 @@
 #include <openssl/evp.h>
 
 /* OIDs for custom X.509 extensions (under the IPA Kerberos cert sub-arc) */
-#define OID_SSH_ISSUER_BINDING   "2.16.840.1.113730.3.8.15.3.1"
-#define OID_SSH_AUTHN_INFO       "2.16.840.1.113730.3.8.15.3.2"
+#define OID_KERBEROS_SERVICE_ISSUER_BINDING "2.16.840.1.113730.3.8.15.3.1"
+#define OID_SSH_AUTHN_CONTEXT               "2.16.840.1.113730.3.8.15.3.2"
 
 /* OID for PKINIT SubjectAlternativeName (id-pkinit-san) */
 #define OID_PKINIT_SAN           "1.3.6.1.5.2.2"
@@ -54,31 +54,33 @@
 #define SSH_S4U_CERT_LIFETIME_MAX 300u
 
 /*
- * id-ce-sshKerberosIssuerBinding:
+ * id-ce-kerberosServiceIssuerBinding:
  *   SEQUENCE {
  *     version     INTEGER (0),
+ *     serviceType UTF8String,        -- "ssh", "oidc", "radius", "pam", ...
  *     principal   UTF8String,
  *     enctype     INTEGER,
  *     kvno        INTEGER,
  *     sigAlg      AlgorithmIdentifier,
- *     sshHostKey  SubjectPublicKeyInfo,
+ *     serviceKey  SubjectPublicKeyInfo,
  *     binding     OCTET STRING
  *   }
  */
-typedef struct ssh_issuer_binding_st {
+typedef struct kerberos_service_issuer_binding_st {
 	ASN1_INTEGER      *version;
+	ASN1_UTF8STRING   *service_type;   /* "ssh", "oidc", "radius", "pam", ... */
 	ASN1_UTF8STRING   *principal;
 	ASN1_INTEGER      *enctype;
 	ASN1_INTEGER      *kvno;
 	X509_ALGOR        *sig_alg;
-	X509_PUBKEY       *ssh_host_key;
+	X509_PUBKEY       *service_key;
 	ASN1_OCTET_STRING *binding;
-} SSH_ISSUER_BINDING;
+} KERBEROS_SERVICE_ISSUER_BINDING;
 
-DECLARE_ASN1_FUNCTIONS(SSH_ISSUER_BINDING)
+DECLARE_ASN1_FUNCTIONS(KERBEROS_SERVICE_ISSUER_BINDING)
 
 /*
- * id-ce-sshAuthnInfo:
+ * id-ce-sshAuthnContext:
  *   SEQUENCE {
  *     version         INTEGER (0),
  *     authMethod      UTF8String,
@@ -87,15 +89,15 @@ DECLARE_ASN1_FUNCTIONS(SSH_ISSUER_BINDING)
  *     clientAddress   [1] EXPLICIT UTF8String OPTIONAL
  *   }
  */
-typedef struct ssh_authn_info_st {
+typedef struct ssh_authn_context_st {
 	ASN1_INTEGER      *version;
 	ASN1_UTF8STRING   *auth_method;
 	ASN1_OCTET_STRING *session_id;
 	ASN1_UTF8STRING   *key_fingerprint;  /* [0] EXPLICIT OPTIONAL */
 	ASN1_UTF8STRING   *client_address;   /* [1] EXPLICIT OPTIONAL */
-} SSH_AUTHN_INFO;
+} SSH_AUTHN_CONTEXT;
 
-DECLARE_ASN1_FUNCTIONS(SSH_AUTHN_INFO)
+DECLARE_ASN1_FUNCTIONS(SSH_AUTHN_CONTEXT)
 
 /* gss-s4u-x509-crypto.c */
 EVP_PKEY	*derive_attestation_key(const unsigned char *ikm, size_t ikm_len,

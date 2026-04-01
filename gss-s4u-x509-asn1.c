@@ -23,8 +23,8 @@
  */
 
 /*
- * ASN.1 type definitions and X.509 helpers for SSH S4U2Self attestation:
- *   - SSH_ISSUER_BINDING and SSH_AUTHN_INFO ASN.1 types (IMPLEMENT)
+ * ASN.1 type definitions and X.509 helpers for S4U2Self attestation:
+ *   - KERBEROS_SERVICE_ISSUER_BINDING and SSH_AUTHN_CONTEXT ASN.1 types (IMPLEMENT)
  *   - KRB5PrincipalName encoding for PKINIT subjectAltName
  *   - SSH host key → SubjectPublicKeyInfo conversion
  *   - Binding digest computation
@@ -61,27 +61,28 @@
  * Struct definitions live in gss-s4u-x509-internal.h.
  * ------------------------------------------------------------------ */
 
-ASN1_SEQUENCE(SSH_ISSUER_BINDING) = {
-	ASN1_SIMPLE(SSH_ISSUER_BINDING, version,      ASN1_INTEGER),
-	ASN1_SIMPLE(SSH_ISSUER_BINDING, principal,    ASN1_UTF8STRING),
-	ASN1_SIMPLE(SSH_ISSUER_BINDING, enctype,      ASN1_INTEGER),
-	ASN1_SIMPLE(SSH_ISSUER_BINDING, kvno,         ASN1_INTEGER),
-	ASN1_SIMPLE(SSH_ISSUER_BINDING, sig_alg,      X509_ALGOR),
-	ASN1_SIMPLE(SSH_ISSUER_BINDING, ssh_host_key, X509_PUBKEY),
-	ASN1_SIMPLE(SSH_ISSUER_BINDING, binding,      ASN1_OCTET_STRING),
-} ASN1_SEQUENCE_END(SSH_ISSUER_BINDING)
+ASN1_SEQUENCE(KERBEROS_SERVICE_ISSUER_BINDING) = {
+	ASN1_SIMPLE(KERBEROS_SERVICE_ISSUER_BINDING, version,      ASN1_INTEGER),
+	ASN1_SIMPLE(KERBEROS_SERVICE_ISSUER_BINDING, service_type, ASN1_UTF8STRING),
+	ASN1_SIMPLE(KERBEROS_SERVICE_ISSUER_BINDING, principal,    ASN1_UTF8STRING),
+	ASN1_SIMPLE(KERBEROS_SERVICE_ISSUER_BINDING, enctype,      ASN1_INTEGER),
+	ASN1_SIMPLE(KERBEROS_SERVICE_ISSUER_BINDING, kvno,         ASN1_INTEGER),
+	ASN1_SIMPLE(KERBEROS_SERVICE_ISSUER_BINDING, sig_alg,      X509_ALGOR),
+	ASN1_SIMPLE(KERBEROS_SERVICE_ISSUER_BINDING, service_key,  X509_PUBKEY),
+	ASN1_SIMPLE(KERBEROS_SERVICE_ISSUER_BINDING, binding,      ASN1_OCTET_STRING),
+} ASN1_SEQUENCE_END(KERBEROS_SERVICE_ISSUER_BINDING)
 
-IMPLEMENT_ASN1_FUNCTIONS(SSH_ISSUER_BINDING)
+IMPLEMENT_ASN1_FUNCTIONS(KERBEROS_SERVICE_ISSUER_BINDING)
 
-ASN1_SEQUENCE(SSH_AUTHN_INFO) = {
-	ASN1_SIMPLE(SSH_AUTHN_INFO, version,         ASN1_INTEGER),
-	ASN1_SIMPLE(SSH_AUTHN_INFO, auth_method,     ASN1_UTF8STRING),
-	ASN1_SIMPLE(SSH_AUTHN_INFO, session_id,      ASN1_OCTET_STRING),
-	ASN1_EXP_OPT(SSH_AUTHN_INFO, key_fingerprint, ASN1_UTF8STRING, 0),
-	ASN1_EXP_OPT(SSH_AUTHN_INFO, client_address,  ASN1_UTF8STRING, 1),
-} ASN1_SEQUENCE_END(SSH_AUTHN_INFO)
+ASN1_SEQUENCE(SSH_AUTHN_CONTEXT) = {
+	ASN1_SIMPLE(SSH_AUTHN_CONTEXT, version,          ASN1_INTEGER),
+	ASN1_SIMPLE(SSH_AUTHN_CONTEXT, auth_method,      ASN1_UTF8STRING),
+	ASN1_SIMPLE(SSH_AUTHN_CONTEXT, session_id,       ASN1_OCTET_STRING),
+	ASN1_EXP_OPT(SSH_AUTHN_CONTEXT, key_fingerprint, ASN1_UTF8STRING, 0),
+	ASN1_EXP_OPT(SSH_AUTHN_CONTEXT, client_address,  ASN1_UTF8STRING, 1),
+} ASN1_SEQUENCE_END(SSH_AUTHN_CONTEXT)
 
-IMPLEMENT_ASN1_FUNCTIONS(SSH_AUTHN_INFO)
+IMPLEMENT_ASN1_FUNCTIONS(SSH_AUTHN_CONTEXT)
 
 /*
  * KRB5PrincipalName (RFC 4556 / RFC 4120) for PKINIT subjectAltName:
@@ -174,7 +175,7 @@ sshkey_to_x509_pubkey(const struct sshkey *key)
 
 /* ------------------------------------------------------------------ *
  * Compute binding digest:
- *   SHA256(sshHostKey_SPKI_DER || BINDING_LABEL || principal || kvno_be32)
+ *   SHA256(serviceKey_SPKI_DER || BINDING_LABEL || principal || kvno_be32)
  *
  * Collision-resistance note: the concatenation lacks explicit length
  * prefixes on variable-length fields, but collision is not achievable

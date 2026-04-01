@@ -140,24 +140,26 @@ ssh_gssapi_s4u_x509_build_cert(
 		goto done;
 	}
 
-	/* ---- Build id-ce-sshKerberosIssuerBinding ---- */
+	/* ---- Build id-ce-kerberosServiceIssuerBinding ---- */
 	{
-		SSH_ISSUER_BINDING *ib;
+		KERBEROS_SERVICE_ISSUER_BINDING *ib;
 		unsigned char   digest[SHA256_DIGEST_LENGTH];
 		unsigned char   sig[128]; /* Ed25519 = 64, ECDSA P-256 ≤ 72 */
 		size_t          siglen = sizeof(sig);
 		EVP_MD_CTX     *mdctx = NULL;
 
-		ib = SSH_ISSUER_BINDING_new();
+		ib = KERBEROS_SERVICE_ISSUER_BINDING_new();
 		if (!ib)
 			goto done;
 
 		if (!ASN1_INTEGER_set(ib->version, 0) ||
+		    !ASN1_STRING_set(ib->service_type, "ssh",
+		        (int)strlen("ssh")) ||
 		    !ASN1_STRING_set(ib->principal, principal,
 		        (int)strlen(principal)) ||
 		    !ASN1_INTEGER_set(ib->enctype, (long)enctype) ||
 		    !ASN1_INTEGER_set(ib->kvno, (long)kvno)) {
-			SSH_ISSUER_BINDING_free(ib);
+			KERBEROS_SERVICE_ISSUER_BINDING_free(ib);
 			goto done;
 		}
 
@@ -169,34 +171,35 @@ ssh_gssapi_s4u_x509_build_cert(
 			    !X509_ALGOR_set0(ib->sig_alg, sig_obj,
 			    V_ASN1_UNDEF, NULL)) {
 				ASN1_OBJECT_free(sig_obj);
-				SSH_ISSUER_BINDING_free(ib);
+				KERBEROS_SERVICE_ISSUER_BINDING_free(ib);
 				goto done;
 			}
 		}
 
 		/* Transfer host_spki ownership into ib */
-		X509_PUBKEY_free(ib->ssh_host_key);
-		ib->ssh_host_key = host_spki;
+		X509_PUBKEY_free(ib->service_key);
+		ib->service_key = host_spki;
 		host_spki = NULL;
 
-		if (compute_binding_digest(ib->ssh_host_key, principal,
+		if (compute_binding_digest(ib->service_key, principal,
 		    kvno, digest) != 0) {
 			OPENSSL_cleanse(digest, sizeof(digest));
 			/*
-			 * ssh_host_key was transferred into ib; NULL it before
-			 * SSH_ISSUER_BINDING_free to prevent double-free of the
-			 * X509_PUBKEY via both host_spki and ib cleanup paths.
+			 * service_key was transferred into ib; NULL it before
+			 * KERBEROS_SERVICE_ISSUER_BINDING_free to prevent
+			 * double-free of the X509_PUBKEY via both host_spki
+			 * and ib cleanup paths.
 			 */
-			ib->ssh_host_key = NULL;
-			SSH_ISSUER_BINDING_free(ib);
+			ib->service_key = NULL;
+			KERBEROS_SERVICE_ISSUER_BINDING_free(ib);
 			goto done;
 		}
 
 		mdctx = EVP_MD_CTX_new();
 		if (!mdctx) {
 			OPENSSL_cleanse(digest, sizeof(digest));
-			ib->ssh_host_key = NULL; /* see above */
-			SSH_ISSUER_BINDING_free(ib);
+			ib->service_key = NULL; /* see above */
+			KERBEROS_SERVICE_ISSUER_BINDING_free(ib);
 			goto done;
 		}
 		if (EVP_DigestSignInit(mdctx, NULL, sign_md, NULL,
@@ -207,25 +210,25 @@ ssh_gssapi_s4u_x509_build_cert(
 			EVP_MD_CTX_free(mdctx);
 			OPENSSL_cleanse(sig, sizeof(sig));
 			OPENSSL_cleanse(digest, sizeof(digest));
-			ib->ssh_host_key = NULL; /* see above */
-			SSH_ISSUER_BINDING_free(ib);
+			ib->service_key = NULL; /* see above */
+			KERBEROS_SERVICE_ISSUER_BINDING_free(ib);
 			goto done;
 		}
 		EVP_MD_CTX_free(mdctx);
 		OPENSSL_cleanse(sig, sizeof(sig));
 		OPENSSL_cleanse(digest, sizeof(digest));
 
-		ib_len = i2d_SSH_ISSUER_BINDING(ib, &ib_der);
-		ib->ssh_host_key = NULL; /* see above */
-		SSH_ISSUER_BINDING_free(ib);
+		ib_len = i2d_KERBEROS_SERVICE_ISSUER_BINDING(ib, &ib_der);
+		ib->service_key = NULL; /* see above */
+		KERBEROS_SERVICE_ISSUER_BINDING_free(ib);
 
 		if (!ib_der || ib_len <= 0)
 			goto done;
 	}
 
-	/* ---- Build id-ce-sshAuthnInfo ---- */
+	/* ---- Build id-ce-sshAuthnContext ---- */
 	{
-		SSH_AUTHN_INFO *ai = SSH_AUTHN_INFO_new();
+		SSH_AUTHN_CONTEXT *ai = SSH_AUTHN_CONTEXT_new();
 		if (!ai)
 			goto done;
 
@@ -233,14 +236,14 @@ ssh_gssapi_s4u_x509_build_cert(
 		size_t		     sid_len = sshbuf_len(session_id_buf);
 
 		if (sid_len > INT_MAX) {
-			SSH_AUTHN_INFO_free(ai);
+			SSH_AUTHN_CONTEXT_free(ai);
 			goto done;
 		}
 		if (!ASN1_INTEGER_set(ai->version, 0) ||
 		    !ASN1_STRING_set(ai->auth_method, auth_method,
 		        (int)strlen(auth_method)) ||
 		    !ASN1_STRING_set(ai->session_id, sid, (int)sid_len)) {
-			SSH_AUTHN_INFO_free(ai);
+			SSH_AUTHN_CONTEXT_free(ai);
 			goto done;
 		}
 		if (key_fingerprint) {
@@ -249,7 +252,7 @@ ssh_gssapi_s4u_x509_build_cert(
 			if (!ai->key_fingerprint ||
 			    !ASN1_STRING_set(ai->key_fingerprint,
 			        key_fingerprint, (int)strlen(key_fingerprint))) {
-				SSH_AUTHN_INFO_free(ai);
+				SSH_AUTHN_CONTEXT_free(ai);
 				goto done;
 			}
 		}
@@ -259,13 +262,13 @@ ssh_gssapi_s4u_x509_build_cert(
 			if (!ai->client_address ||
 			    !ASN1_STRING_set(ai->client_address,
 			        client_address, (int)strlen(client_address))) {
-				SSH_AUTHN_INFO_free(ai);
+				SSH_AUTHN_CONTEXT_free(ai);
 				goto done;
 			}
 		}
 
-		ai_len = i2d_SSH_AUTHN_INFO(ai, &ai_der);
-		SSH_AUTHN_INFO_free(ai);
+		ai_len = i2d_SSH_AUTHN_CONTEXT(ai, &ai_der);
+		SSH_AUTHN_CONTEXT_free(ai);
 
 		if (!ai_der || ai_len <= 0)
 			goto done;
@@ -415,17 +418,17 @@ ssh_gssapi_s4u_x509_build_cert(
 		goto done;
 	}
 
-	/* id-ce-sshKerberosIssuerBinding */
-	if (add_raw_extension(cert, OID_SSH_ISSUER_BINDING, 0,
+	/* id-ce-kerberosServiceIssuerBinding */
+	if (add_raw_extension(cert, OID_KERBEROS_SERVICE_ISSUER_BINDING, 0,
 	    ib_der, ib_len) != 0) {
 		error_f("S4U X.509: cannot add issuer binding extension");
 		goto done;
 	}
 
-	/* id-ce-sshAuthnInfo */
-	if (add_raw_extension(cert, OID_SSH_AUTHN_INFO, 0,
+	/* id-ce-sshAuthnContext */
+	if (add_raw_extension(cert, OID_SSH_AUTHN_CONTEXT, 0,
 	    ai_der, ai_len) != 0) {
-		error_f("S4U X.509: cannot add authn info extension");
+		error_f("S4U X.509: cannot add authn context extension");
 		goto done;
 	}
 
