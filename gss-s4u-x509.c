@@ -126,7 +126,7 @@ ssh_gssapi_s4u_x509_build_cert(
 	xasprintf(&principal, "host/%s@%s", hostname, realm);
 
 	derived_key = derive_attestation_key(ikm, ikm_len,
-	    hostname, realm, kvno, fips_mode);
+	    hostname, realm, kvno, fips_mode, "ssh-attestation-v1");
 	if (!derived_key) {
 		/* derive_attestation_key logs the specific failure */
 		goto done;
@@ -182,7 +182,7 @@ ssh_gssapi_s4u_x509_build_cert(
 		host_spki = NULL;
 
 		if (compute_binding_digest(ib->service_key, principal,
-		    kvno, digest) != 0) {
+		    kvno, "ssh-attestation-binding-v1", digest) != 0) {
 			OPENSSL_cleanse(digest, sizeof(digest));
 			/*
 			 * service_key was transferred into ib; NULL it before

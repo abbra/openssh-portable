@@ -183,7 +183,8 @@ out:
  * ------------------------------------------------------------------ */
 EVP_PKEY *
 derive_attestation_key(const unsigned char *ikm, size_t ikm_len,
-    const char *hostname, const char *realm, uint32_t kvno, int fips_mode)
+    const char *hostname, const char *realm, uint32_t kvno, int fips_mode,
+    const char *hkdf_salt)
 {
 	unsigned char	 seed[48];
 	size_t		 seed_len = fips_mode ? 48 : 32;
@@ -200,7 +201,7 @@ derive_attestation_key(const unsigned char *ikm, size_t ikm_len,
 		error_f("S4U X.509: HKDF info assembly failed");
 		goto done;
 	}
-	if (hkdf_sha256(ikm, ikm_len, HKDF_SALT, strlen(HKDF_SALT),
+	if (hkdf_sha256(ikm, ikm_len, hkdf_salt, strlen(hkdf_salt),
 	    sshbuf_ptr(info), sshbuf_len(info), seed, seed_len) != 0)
 		goto done; /* hkdf_sha256 logs its own errors */
 

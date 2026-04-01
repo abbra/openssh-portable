@@ -47,9 +47,6 @@
 /* OID for id-pkinit-KPClientAuth extended key usage */
 #define OID_PKINIT_KP_CLIENTAUTH "1.3.6.1.5.2.3.4"
 
-#define BINDING_LABEL            "ssh-attestation-binding-v1"
-#define HKDF_SALT                "ssh-attestation-v1"
-
 /* Maximum lifetime for attestation certificates (seconds) */
 #define SSH_S4U_CERT_LIFETIME_MAX 300u
 
@@ -102,7 +99,7 @@ DECLARE_ASN1_FUNCTIONS(SSH_AUTHN_CONTEXT)
 /* gss-s4u-x509-crypto.c */
 EVP_PKEY	*derive_attestation_key(const unsigned char *ikm, size_t ikm_len,
 		    const char *hostname, const char *realm,
-		    uint32_t kvno, int fips_mode);
+		    uint32_t kvno, int fips_mode, const char *hkdf_salt);
 EVP_PKEY	*generate_ephemeral_key(int fips_mode);
 
 /* gss-s4u-x509-asn1.c */
@@ -110,6 +107,7 @@ struct sshkey;
 X509_PUBKEY	*sshkey_to_x509_pubkey(const struct sshkey *key);
 int		 compute_binding_digest(X509_PUBKEY *spki,
 		    const char *principal, uint32_t kvno,
+		    const char *binding_label,
 		    unsigned char digest[SHA256_DIGEST_LENGTH]);
 int		 add_raw_extension(X509 *cert, const char *oid_str,
 		    int critical, const unsigned char *der, int der_len);

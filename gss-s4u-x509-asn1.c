@@ -188,7 +188,8 @@ sshkey_to_x509_pubkey(const struct sshkey *key)
  * ------------------------------------------------------------------ */
 int
 compute_binding_digest(X509_PUBKEY *spki, const char *principal,
-    uint32_t kvno, unsigned char digest[SHA256_DIGEST_LENGTH])
+    uint32_t kvno, const char *binding_label,
+    unsigned char digest[SHA256_DIGEST_LENGTH])
 {
 	unsigned char	*spki_der = NULL;
 	int		 spki_len;
@@ -203,10 +204,10 @@ compute_binding_digest(X509_PUBKEY *spki, const char *principal,
 
 	b = sshbuf_new();
 	if (b == NULL ||
-	    sshbuf_put(b, spki_der,     (size_t)spki_len)        != 0 ||
-	    sshbuf_put(b, BINDING_LABEL, strlen(BINDING_LABEL))  != 0 ||
-	    sshbuf_put(b, principal,    strlen(principal))        != 0 ||
-	    sshbuf_put(b, &kvno_be,     sizeof(kvno_be))          != 0 ||
+	    sshbuf_put(b, spki_der,      (size_t)spki_len)           != 0 ||
+	    sshbuf_put(b, binding_label, strlen(binding_label))      != 0 ||
+	    sshbuf_put(b, principal,     strlen(principal))          != 0 ||
+	    sshbuf_put(b, &kvno_be,      sizeof(kvno_be))             != 0 ||
 	    EVP_Q_digest(NULL, "SHA256", NULL,
 	        sshbuf_ptr(b), sshbuf_len(b), digest, &dlen) != 1)
 		goto done;
