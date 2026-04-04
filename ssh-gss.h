@@ -216,6 +216,29 @@ void ssh_gssapi_s4u2proxy(char **, u_int, u_int);
 void ssh_gssapi_krb5_filter_ccache(u_int, char **, u_int);
 const char *ssh_gssapi_displayname(void);
 
+/* Out-of-process S4U2Self/S4U2Proxy via sshd-gssapi-helper */
+#if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL)
+/* Helper lifecycle (gss-serv-helper.c) */
+int  ssh_gssapi_helper_start(void);
+void ssh_gssapi_helper_stop(void);
+void ssh_gssapi_helper_handoff(void);
+void ssh_gssapi_helper_cleanup(void);
+/* Low-level helper protocol operations (gss-serv-helper.c) */
+int  ssh_gssapi_helper_impersonate(ssh_gssapi_client *,
+    const char *, u_int, struct ssh *, struct Authctxt *);
+void ssh_gssapi_helper_storecreds_impersonated(ssh_gssapi_client *);
+void ssh_gssapi_helper_delegate(ssh_gssapi_client *,
+    const char **, u_int, u_int);
+void ssh_gssapi_helper_filter_creds(ssh_gssapi_client *,
+    u_int, const char **, u_int);
+/* High-level wrappers using module-static gssapi_client (gss-serv.c) */
+int  ssh_gssapi_impersonate_s4u2self(const char *, u_int,
+    struct ssh *, struct Authctxt *);
+void ssh_gssapi_storecreds_impersonated(void);
+void ssh_gssapi_delegate_s4u2proxy(char **, u_int, u_int);
+void ssh_gssapi_filter_impersonated(u_int, char **, u_int);
+#endif /* KRB5 && !HEIMDAL && WITH_OPENSSL */
+
 char *ssh_gssapi_server_mechanisms(void);
 int ssh_gssapi_oid_table_ok(void);
 

@@ -65,6 +65,7 @@
 # endif
 # include <openssl/evp.h>
 # include "gss-s4u-x509.h"
+# include "sshd-gssapi-helper.h"
 #endif
 
 extern ServerOptions options;
@@ -1101,6 +1102,54 @@ ssh_gssapi_s4u2proxy(char **services, u_int nservices, u_int lifetime)
 
 	unsetenv("KRB5CCNAME");
 }
+
+#if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL)
+/*
+ * Wrappers that route S4U operations through the out-of-process helper.
+ * These access the module-static gssapi_client and forward to the helper
+ * protocol functions in gss-serv-helper.c.  The caller is responsible for
+ * having called ssh_gssapi_helper_start() first.
+ */
+
+/* Privileged — runs as root; helper drops to user uid internally. */
+int
+ssh_gssapi_impersonate_s4u2self(const char *user, u_int lifetime,
+    struct ssh *ssh, Authctxt *authctxt)
+{
+	return ssh_gssapi_helper_impersonate(&gssapi_client,
+	    user, lifetime, ssh, authctxt);
+}
+
+/*
+ * No-op: the helper stores the impersonated credential atomically during
+ * the IMPERSONATE exchange before it replies SUCCESS.
+ */
+void
+ssh_gssapi_storecreds_impersonated(void)
+{
+	ssh_gssapi_helper_storecreds_impersonated(&gssapi_client);
+}
+
+/* Runs as helper's user uid (already dropped after IMPERSONATE). */
+void
+ssh_gssapi_delegate_s4u2proxy(char **services, u_int nservices, u_int lifetime)
+{
+	ssh_gssapi_helper_delegate(&gssapi_client,
+	    (const char **)services, nservices, lifetime);
+}
+
+/*
+ * Filter the user ccache via the helper.
+ * SSH_GSSAPI_CCFILTER_* and SSH_GSSAPI_HLP_FILTER_* share bit values.
+ */
+void
+ssh_gssapi_filter_impersonated(u_int filter_flags,
+    char **services, u_int nservices)
+{
+	ssh_gssapi_helper_filter_creds(&gssapi_client,
+	    filter_flags, (const char **)services, nservices);
+}
+#endif /* KRB5 && !HEIMDAL && WITH_OPENSSL */
 
 #ifndef KRB5
 /* As user - called on fatal/exit; full implementation in gss-serv-krb5.c */

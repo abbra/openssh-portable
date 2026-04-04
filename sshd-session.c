@@ -1480,21 +1480,23 @@ main(int ac, char **av)
 			debug_f("user %.100s already has valid Kerberos "
 			    "credentials, skipping S4U2Self",
 			    authctxt->user);
-		} else if (ssh_gssapi_s4u2self(authctxt->user, lifetime,
-		    ssh, authctxt) == 0) {
+#if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL)
+		} else if (ssh_gssapi_helper_start() != 0) {
+			error_f("failed to start sshd-gssapi-helper; "
+			    "S4U2Self skipped");
+		} else if (ssh_gssapi_impersonate_s4u2self(authctxt->user,
+		    lifetime, ssh, authctxt) == 0) {
 			u_int filter;
 
-			temporarily_use_uid(authctxt->pw);
 			/*
-			 * Always create the ccache via storecreds_s4u2self so
-			 * that s4u2proxy has a ccache to store tickets into.
-			 * gss_krb5_copy_ccache() copies the host service's own
-			 * TGT along with the evidence ticket; filter_ccache
-			 * removes the ticket classes that should not be kept.
+			 * The helper stores the impersonated credential into the
+			 * user ccache atomically during IMPERSONATE (before
+			 * dropping to user uid and replying SUCCESS).
+			 * storecreds_impersonated() is therefore a no-op here.
 			 */
-			ssh_gssapi_storecreds_s4u2self();
+			ssh_gssapi_storecreds_impersonated();
 			if (options.num_gss_proxy_services > 0)
-				ssh_gssapi_s4u2proxy(
+				ssh_gssapi_delegate_s4u2proxy(
 				    options.gss_proxy_services,
 				    options.num_gss_proxy_services,
 				    lifetime);
@@ -1515,6 +1517,36 @@ main(int ac, char **av)
 			else if (!options.gss_allow_s4u2self)
 				filter = SSH_GSSAPI_CCFILTER_SELF;
 			if (filter != 0)
+				ssh_gssapi_filter_impersonated(filter,
+				    options.gss_proxy_services,
+				    options.num_gss_proxy_services);
+			ssh_gssapi_helper_handoff();
+		} else {
+			logit("S4U2Self failed for user %.100s, continuing",
+			    authctxt->user);
+			ssh_gssapi_helper_stop();
+		}
+#else /* !(KRB5 && !HEIMDAL && WITH_OPENSSL) */
+		} else if (ssh_gssapi_s4u2self(authctxt->user, lifetime,
+		    ssh, authctxt) == 0) {
+			u_int filter;
+
+			temporarily_use_uid(authctxt->pw);
+			ssh_gssapi_storecreds_s4u2self();
+			if (options.num_gss_proxy_services > 0)
+				ssh_gssapi_s4u2proxy(
+				    options.gss_proxy_services,
+				    options.num_gss_proxy_services,
+				    lifetime);
+
+			filter = 0;
+			if (options.gss_allow_s4u2self &&
+			    options.num_gss_proxy_services == 0)
+				filter = SSH_GSSAPI_CCFILTER_TGT |
+				    SSH_GSSAPI_CCFILTER_PROXY;
+			else if (!options.gss_allow_s4u2self)
+				filter = SSH_GSSAPI_CCFILTER_SELF;
+			if (filter != 0)
 				ssh_gssapi_krb5_filter_ccache(filter,
 				    options.gss_proxy_services,
 				    options.num_gss_proxy_services);
@@ -1523,6 +1555,7 @@ main(int ac, char **av)
 			logit("S4U2Self failed for user %.100s, continuing",
 			    authctxt->user);
 		}
+#endif /* KRB5 && !HEIMDAL && WITH_OPENSSL */
 	}
 #endif
 #ifdef WITH_SELINUX

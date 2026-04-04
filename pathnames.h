@@ -151,6 +151,11 @@
 #define _PATH_SSH_SK_HELPER		"/usr/libexec/ssh-sk-helper"
 #endif
 
+/* Location of sshd-gssapi-helper for out-of-process GSSAPI credential management */
+#ifndef _PATH_SSHD_GSSAPI_HELPER
+#define _PATH_SSHD_GSSAPI_HELPER	"/usr/libexec/sshd-gssapi-helper"
+#endif
+
 /* xauth for X11 forwarding */
 #ifndef _PATH_XAUTH
 #define _PATH_XAUTH			"/usr/X11R6/bin/xauth"

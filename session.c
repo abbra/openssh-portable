@@ -2791,6 +2791,10 @@ do_cleanup(struct ssh *ssh, Authctxt *authctxt)
 		ssh_gssapi_cleanup_creds();
 		restore_uid();
 	}
+#if defined(KRB5) && !defined(HEIMDAL) && defined(WITH_OPENSSL)
+	/* Shut down the helper process; destroys the user ccache if still set. */
+	ssh_gssapi_helper_cleanup();
+#endif
 #endif
 
 	/* remove agent socket */

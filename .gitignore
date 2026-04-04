@@ -38,3 +38,4 @@ sshd-auth
 !regress/unittests/**/Makefile
 tags
 
+sshd-gssapi-helper
